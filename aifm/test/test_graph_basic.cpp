@@ -31,7 +31,7 @@ static void build_toy_local(CSRLocal& G){
   G.finalize();
 }
 
-// ---------- far graph builder (works with templated CSRFar) ----------
+// ---------- far graph builder ----------
 template <typename CSRFarT>
 static void build_toy_far(CSRFarT& G){
   G.add_edge(0,1);
@@ -43,16 +43,14 @@ static void build_toy_far(CSRFarT& G){
 }
 
 // ---------- runtime entry ----------
-constexpr uint64_t kCacheSize    = 256 * Region::kSize;  // same style as other tests
-constexpr uint64_t kFarMemSize   = (1ULL << 33);         // 8 GB for FakeDevice bring-up
+constexpr uint64_t kCacheSize    = 256 * Region::kSize;
+constexpr uint64_t kFarMemSize   = (1ULL << 33);
 constexpr uint64_t kNumGCThreads = 12;
 
-// choose compile-time capacities for our far CSR
 static constexpr int32_t  kNVerts   = 6;
 static constexpr uint64_t kMaxEdges = 16;
 
 static void _main(void *arg) {
-  // Build FarMemManager exactly like AIFM tests do
   unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
 
@@ -72,9 +70,10 @@ static void _main(void *arg) {
 
   // 2) FAR CSR on AIFM Array<T,N>
   {
-    fargraph::CSRFar<kNVerts, kMaxEdges> F;  // templated far graph
+    // NOTE: pass manager to CSRFar ctor
+    fargraph::CSRFar<kNVerts, kMaxEdges> F(manager.get());
     build_toy_far(F);
-    F.finalize(manager.get());               // allocate arrays & copy once
+    F.finalize();  // no args now
 
     auto t0 = chrono::high_resolution_clock::now();
     auto dist = fargraph::bfs_far(F, /*src=*/0, nullptr);
@@ -98,3 +97,4 @@ int main(int argc, char *argv[]) {
   }
   return 0;
 }
+// ---------- end of file ----------
