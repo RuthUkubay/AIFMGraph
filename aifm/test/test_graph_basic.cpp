@@ -7,7 +7,7 @@ extern "C" {
 #include "device.hpp"
 #include "manager.hpp"
 
-// our graph headers (header-only under inc/)
+// our graph headers (header-only under aifm/inc/)
 #include "graph_local.hpp"
 #include "graph_far.hpp"
 
@@ -15,6 +15,7 @@ extern "C" {
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <vector>
 
 using namespace std;
@@ -32,8 +33,6 @@ static void build_toy_local(CSRLocal& G){
   G.finalize();
 }
 
-/* ---------------- far graph (works with templated CSRFar) ---------------- */
-
 template <typename CSRFarT>
 static void build_toy_far(CSRFarT& G){
   G.add_edge(0,1);
@@ -44,66 +43,33 @@ static void build_toy_far(CSRFarT& G){
   G.add_edge(4,5);
 }
 
+/* ---------------- scalable synthetic graph builders ---------------- */
+
+static void build_ring_plus_random_local(CSRLocal& G, int32_t n, int deg = 4) {
+  // ring backbone
+  for (int32_t u = 0; u < n; ++u) G.add_edge(u, (u + 1) % n);
+  // extra random edges per node
+  std::mt19937 rng(123);
+  std::uniform_int_distribution<int32_t> dist(0, n - 1);
+  for (int32_t u = 0; u < n; ++u) {
+    for (int k = 1; k < deg; ++k) G.add_edge(u, dist(rng));
+  }
+  G.finalize();
+}
+
+template <typename CSRFarT>
+static void build_ring_plus_random_far(CSRFarT& G, int32_t n, int deg = 4) {
+  for (int32_t u = 0; u < n; ++u) G.add_edge(u, (u + 1) % n);
+  std::mt19937 rng(123);
+  std::uniform_int_distribution<int32_t> dist(0, n - 1);
+  for (int32_t u = 0; u < n; ++u) {
+    for (int k = 1; k < deg; ++k) G.add_edge(u, dist(rng));
+  }
+}
+
 /* ---------------- runtime entry ---------------- */
 
-constexpr uint64_t kCacheSize    = 256 * Region::kSize; // same style as other tests
-constexpr uint64_t kFarMemSize   = (1ULL << 33);        // 8 GB for FakeDevice bring-up
-constexpr uint64_t kNumGCThreads = 12;
-
-// compile-time capacities for far CSR
-static constexpr int32_t  kNVerts   = 6;
-static constexpr uint64_t kMaxEdges = 16;
-
-static void _main(void *arg) {
-  // Build FarMemManager exactly like other AIFM tests
-  unique_ptr<FarMemManager> manager(
-      FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
-
-  // 1) LOCAL baseline
-  {
-    CSRLocal L(kNVerts);
-    build_toy_local(L);
-
-    auto t0 = chrono::high_resolution_clock::now();
-    auto dist = bfs_local(L, /*src=*/0, nullptr);
-    auto t1 = chrono::high_resolution_clock::now();
-
-    cout << "local: dist[5]=" << dist[5]
-         << " ms=" << chrono::duration_cast<chrono::milliseconds>(t1 - t0).count()
-         << "\n";
-  }
-
-  // 2) FAR CSR on AIFM Array<T,N>
-  {
-    // allocate arrays with manager, then wrap them by reference in CSRFar
-    auto off = manager->allocate_array<int32_t, kNVerts>();
-    auto deg = manager->allocate_array<int32_t, kNVerts>();
-    auto nbr = manager->allocate_array<int32_t, kMaxEdges>();
-
-    fargraph::CSRFar<kNVerts, kMaxEdges> F(off, deg, nbr);
-    build_toy_far(F);
-    F.finalize();  // copies CSR into far arrays with one DerefScope
-
-    auto t0 = chrono::high_resolution_clock::now();
-    auto dist = fargraph::bfs_far(F, /*src=*/0, nullptr);
-    auto t1 = chrono::high_resolution_clock::now();
-
-    cout << "far:   dist[5]=" << dist[5]
-         << " ms=" << chrono::duration_cast<chrono::milliseconds>(t1 - t0).count()
-         << "\n";
-  }
-}
-
-int main(int argc, char *argv[]) {
-  if (argc < 2) {
-    std::cerr << "usage: " << argv[0] << " [cfg_file]\n";
-    return -EINVAL;
-  }
-  int ret = runtime_init(argv[1], _main, NULL);
-  if (ret) {
-    std::cerr << "failed to start runtime\n";
-    return ret;
-  }
-  return 0;
-}
-// ---------- end of file ----------
+// Use the same style as other AIFM tests
+constexpr uint64_t kCacheSize    = 256 * Region::kSize; // local cache for far mem
+constexpr uint64_t kFarMemSize   = (1ULL << 33);        // 8 GB FakeDevice
+constexpr uint64_t kNumGCThreads = 12_
