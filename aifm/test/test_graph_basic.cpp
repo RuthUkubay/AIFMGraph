@@ -7,7 +7,7 @@ extern "C" {
 #include "device.hpp"
 #include "manager.hpp"
 
-// our graph headers (header-only, under inc/)
+// our graph headers (header-only under inc/)
 #include "graph_local.hpp"
 #include "graph_far.hpp"
 
@@ -20,7 +20,8 @@ extern "C" {
 using namespace std;
 using namespace far_memory;
 
-// ---------- tiny local graph for sanity ----------
+/* ---------------- tiny local graph for sanity ---------------- */
+
 static void build_toy_local(CSRLocal& G){
   G.add_edge(0,1);
   G.add_edge(0,2);
@@ -31,7 +32,8 @@ static void build_toy_local(CSRLocal& G){
   G.finalize();
 }
 
-// ---------- far graph builder ----------
+/* ---------------- far graph (works with templated CSRFar) ---------------- */
+
 template <typename CSRFarT>
 static void build_toy_far(CSRFarT& G){
   G.add_edge(0,1);
@@ -42,15 +44,18 @@ static void build_toy_far(CSRFarT& G){
   G.add_edge(4,5);
 }
 
-// ---------- runtime entry ----------
-constexpr uint64_t kCacheSize    = 256 * Region::kSize;
-constexpr uint64_t kFarMemSize   = (1ULL << 33);
+/* ---------------- runtime entry ---------------- */
+
+constexpr uint64_t kCacheSize    = 256 * Region::kSize; // same style as other tests
+constexpr uint64_t kFarMemSize   = (1ULL << 33);        // 8 GB for FakeDevice bring-up
 constexpr uint64_t kNumGCThreads = 12;
 
+// compile-time capacities for far CSR
 static constexpr int32_t  kNVerts   = 6;
 static constexpr uint64_t kMaxEdges = 16;
 
 static void _main(void *arg) {
+  // Build FarMemManager exactly like other AIFM tests
   unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
 
@@ -70,10 +75,14 @@ static void _main(void *arg) {
 
   // 2) FAR CSR on AIFM Array<T,N>
   {
-    // NOTE: pass manager to CSRFar ctor
-    fargraph::CSRFar<kNVerts, kMaxEdges> F(manager.get());
+    // allocate arrays with manager, then wrap them by reference in CSRFar
+    auto off = manager->allocate_array<int32_t, kNVerts>();
+    auto deg = manager->allocate_array<int32_t, kNVerts>();
+    auto nbr = manager->allocate_array<int32_t, kMaxEdges>();
+
+    fargraph::CSRFar<kNVerts, kMaxEdges> F(off, deg, nbr);
     build_toy_far(F);
-    F.finalize();  // no args now
+    F.finalize();  // copies CSR into far arrays with one DerefScope
 
     auto t0 = chrono::high_resolution_clock::now();
     auto dist = fargraph::bfs_far(F, /*src=*/0, nullptr);

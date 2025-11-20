@@ -6,44 +6,38 @@
 
 #include "array.hpp"        // far_memory::Array<T, N>
 #include "deref_scope.hpp"  // far_memory::DerefScope
-#include "manager.hpp"      // FarMemManager
 
 namespace fargraph {
 using i32 = int32_t;
 
-/* Far-memory CSR with compile-time capacities:
- * - N_VERTS: number of vertices (fixed at compile time)
- * - MAX_EDGES: capacity for edges (upper bound; enforce at finalize)
- *
- * AIFM notes:
- *  - Array<T,N> must be constructed with FarMemManager* (no default/move).
- *  - at()/at_mut() are non-const -> don't call them through const objects.
- *  - Keep exactly one live DerefScope per thread when accessing far memory.
+/* Far-memory CSR with compile-time capacities.
+ * IMPORTANT: Arrays are owned/constructed OUTSIDE by FarMemManager; we store REFERENCES here.
  */
 template <i32 N_VERTS, uint64_t MAX_EDGES>
 struct CSRFar {
   static_assert(N_VERTS > 0, "N_VERTS must be > 0");
   static_assert(MAX_EDGES > 0, "MAX_EDGES must be > 0");
-  static constexpr i32 kN = N_VERTS;
 
-  // Far arrays (constructed with manager in ctor init-list)
-  far_memory::Array<i32, N_VERTS>   off;
-  far_memory::Array<i32, N_VERTS>   deg;
-  far_memory::Array<i32, MAX_EDGES> nbr;
+  // References to far arrays (constructed by FarMemManager in the caller)
+  far_memory::Array<i32, N_VERTS>   &off;
+  far_memory::Array<i32, N_VERTS>   &deg;
+  far_memory::Array<i32, MAX_EDGES> &nbr;
 
-  // Host-side builder before finalize()
+  // Host-side builder
   std::vector<std::vector<i32>> adj_tmp;
 
-  // IMPORTANT: Array<T,N> requires FarMemManager* here
-  explicit CSRFar(far_memory::FarMemManager* mm)
-      : off(mm), deg(mm), nbr(mm), adj_tmp(N_VERTS) {}
+  // Bind references in ctor
+  CSRFar(far_memory::Array<i32, N_VERTS>   &off_,
+         far_memory::Array<i32, N_VERTS>   &deg_,
+         far_memory::Array<i32, MAX_EDGES> &nbr_)
+      : off(off_), deg(deg_), nbr(nbr_), adj_tmp(N_VERTS) {}
 
   inline void add_edge(i32 u, i32 v) {
     if (u < 0 || u >= N_VERTS || v < 0 || v >= N_VERTS) return;
     adj_tmp[u].push_back(v);
   }
 
-  // Build CSR locally and copy into far arrays.
+  // Build CSR locally and copy into far arrays (ONE DerefScope)
   inline void finalize() {
     std::vector<i32> off_l(N_VERTS), deg_l(N_VERTS);
     uint64_t E = 0;
@@ -53,13 +47,12 @@ struct CSRFar {
       E += static_cast<uint64_t>(deg_l[u]);
     }
     if (E > MAX_EDGES) {
-      fprintf(stderr,
-              "CSRFar::finalize: edges=%lu exceed MAX_EDGES=%lu\n",
+      fprintf(stderr, "CSRFar::finalize: edges=%lu exceed MAX_EDGES=%lu\n",
               (unsigned long)E, (unsigned long)MAX_EDGES);
       abort();
     }
 
-    far_memory::DerefScope scope;  // one live scope
+    far_memory::DerefScope scope;
     for (i32 u = 0; u < N_VERTS; ++u) {
       off.at_mut(scope, u) = off_l[u];
       deg.at_mut(scope, u) = deg_l[u];
@@ -73,22 +66,21 @@ struct CSRFar {
     adj_tmp.clear(); adj_tmp.shrink_to_fit();
   }
 
-  // Non-const: at() is non-const
-  inline void neighbor_span(i32 u, far_memory::DerefScope& scope,
-                            i32& start, i32& len) {
+  // Non-const (Array::at is non-const)
+  inline void neighbor_span(i32 u, far_memory::DerefScope &scope,
+                            i32 &start, i32 &len) {
     start = off.at(scope, u);
     len   = deg.at(scope, u);
   }
 };
 
-// BFS over far CSR
+// BFS (takes non-const graph because Array::at is non-const)
 template <i32 N_VERTS, uint64_t MAX_EDGES>
-inline std::vector<int> bfs_far(CSRFar<N_VERTS, MAX_EDGES>& G, // non-const
-                                int src, std::vector<int>* parent = nullptr) {
+inline std::vector<int> bfs_far(CSRFar<N_VERTS, MAX_EDGES> &G,
+                                int src, std::vector<int> *parent = nullptr) {
   const int n = N_VERTS;
   std::vector<int> dist(n, -1);
   if (parent) parent->assign(n, -1);
-
   if (src < 0 || src >= n) return dist;
 
   std::queue<int> q;
@@ -96,7 +88,7 @@ inline std::vector<int> bfs_far(CSRFar<N_VERTS, MAX_EDGES>& G, // non-const
   if (parent) (*parent)[src] = src;
   q.push(src);
 
-  far_memory::DerefScope scope; // one live scope
+  far_memory::DerefScope scope;
 
   while (!q.empty()) {
     int u = q.front(); q.pop();
@@ -117,3 +109,4 @@ inline std::vector<int> bfs_far(CSRFar<N_VERTS, MAX_EDGES>& G, // non-const
 }
 
 } // namespace fargraph
+// ---------- end of file ----------
