@@ -72,4 +72,4 @@ static void build_ring_plus_random_far(CSRFarT& G, int32_t n, int deg = 4) {
 // Use the same style as other AIFM tests
 constexpr uint64_t kCacheSize    = 256 * Region::kSize; // local cache for far mem
 constexpr uint64_t kFarMemSize   = (1ULL << 33);        // 8 GB FakeDevice
-constexpr uint64_t kNumGCThreads = 12_
+constexpr uint64_t kNumGCThreads = 12;
