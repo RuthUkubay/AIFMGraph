@@ -43,10 +43,10 @@ static void build_toy_far(CSRFarT& G){
   G.add_edge(4,5);
 }
 
-/* ---------------- scalable synthetic graph builders ---------------- */
+/* ---------------- scalable so we can see differences ---------------- */
 
 static void build_ring_plus_random_local(CSRLocal& G, int32_t n, int deg = 4) {
-  // ring backbone
+
   for (int32_t u = 0; u < n; ++u) G.add_edge(u, (u + 1) % n);
   // extra random edges per node
   std::mt19937 rng(123);
