@@ -95,6 +95,9 @@ test_embedded_pointer_obj = $(test_embedded_pointer_src:.cpp=.o)
 # test_graph_basic_src = test/test_graph_basic.cpp
 # test_graph_basic_obj = $(test_graph_basic_src:.cpp=.o)
 
+test_generate_graph_src = test/test_generate_graph.cpp
+test_generate_graph_obj = $(test_generate_graph_src:.cpp=.o)
+
 lib_src = $(wildcard src/*.cpp)
 lib_src := $(filter-out src/tcp_device_server.cpp,$(lib_src))
 lib_obj = $(lib_src:.cpp=.o)
