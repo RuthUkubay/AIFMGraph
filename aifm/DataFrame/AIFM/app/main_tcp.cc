@@ -213,7 +213,7 @@ void calculate_haversine_distance_column(FarMemManager* manager, StdDataFrame<In
     std::cout << std::endl;
 }
 
-void analyze_trip_timestamp(FarMemManager* manager, StdDataFrame<Index_t>& df)
+void analyze_trip_timestamp(ager* manager, StdDataFrame<Index_t>& df)
 {
     std::cout << "analyze_trip_timestamp()" << std::endl;
 
