@@ -18,9 +18,10 @@ namespace far_memory {
 
 using Vid = uint32_t;
 
+// Make nbrs 'mutable' so we can deref in const methods (logical read-only).
 struct VertexHdr {
-  uint32_t         degree{0};
-  GenericUniquePtr nbrs;    // null if degree==0
+  uint32_t              degree{0};
+  mutable GenericUniquePtr nbrs;   // null if degree==0
 };
 
 class VertexArray : public GenericArray {
@@ -44,7 +45,7 @@ public:
   inline void build_from_edges(const std::vector<std::pair<Vid,Vid>>& edges) {
     const uint64_t N = verts_.size();
 
-    // Phase 1: degree counts (host-side)
+    // Phase 1: degree counts
     std::vector<uint32_t> deg(N, 0);
     for (auto [u,v] : edges) { assert(u < N && v < N); ++deg[u]; }
 
@@ -52,7 +53,7 @@ public:
     {
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
-        auto& vh = deref_vertex(scope, u);        // MUTABLE header
+        auto& vh = deref_vertex(scope, u);              // MUTABLE header
         vh.degree = deg[u];
         if (vh.degree == 0) { vh.nbrs = GenericUniquePtr{}; continue; }
         const uint16_t bytes = static_cast<uint16_t>(vh.degree * sizeof(Vid));
@@ -60,14 +61,14 @@ public:
       }
     }
 
-    // Phase 3: fill neighbors
+    // Phase 3: fill neighbors (mutate arrays)
     std::vector<uint32_t> cur(N, 0);
     {
       DerefScope scope;
       for (auto [u,v] : edges) {
-        const auto& vh = const_deref_vertex(scope, u); // READ header
+        auto& vh = deref_vertex(scope, u);              // MUTABLE header (so nbrs is non-const)
         if (vh.degree == 0) continue;
-        auto* base = static_cast<uint8_t*>(vh.nbrs.deref_mut(scope)); // MUTATE array
+        auto* base = static_cast<uint8_t*>(vh.nbrs.deref_mut(scope));
         reinterpret_cast<Vid*>(base)[cur[u]++] = v;
       }
     }
@@ -78,7 +79,10 @@ public:
   inline NeighborView neighbors(uint64_t u, DerefScope& scope) const {
     const auto& vh = const_deref_vertex(scope, u);      // READ header
     if (vh.degree == 0) return {nullptr, 0};
-    const auto* base = static_cast<const uint8_t*>(vh.nbrs.deref(scope)); // READ array
+    // verts_.slot(u) returns const GenericUniquePtr* in a const method.
+    // Cast away const to invoke non-const deref(); result is const void*.
+    const auto* slot = const_cast<GenericUniquePtr*>(verts_.slot(u));
+    const auto* base = static_cast<const uint8_t*>(slot->deref(scope));
     return { reinterpret_cast<const Vid*>(base), vh.degree };
   }
 
@@ -91,11 +95,13 @@ private:
   VertexArray    verts_;
 
   inline VertexHdr& deref_vertex(const DerefScope& scope, uint64_t i) {
-    void* p = verts_.slot(i)->deref_mut(scope);   // MUTABLE header
+    void* p = verts_.slot(i)->deref_mut(scope);         // MUTABLE header
     return *reinterpret_cast<VertexHdr*>(p);
   }
   inline const VertexHdr& const_deref_vertex(const DerefScope& scope, uint64_t i) const {
-    const void* p = verts_.slot(i)->deref(scope); // READ-ONLY header
+    // Need non-const handle to call deref(); returned data pointer is const.
+    auto* slot = const_cast<GenericUniquePtr*>(verts_.slot(i));
+    const void* p = slot->deref(scope);                 // READ-ONLY header
     return *reinterpret_cast<const VertexHdr*>(p);
   }
 };
