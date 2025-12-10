@@ -13,13 +13,18 @@ extern "C" {
 #include <utility>
 #include <cstdint>
 #include <cassert>
+#include <atomic>
+#include "object.hpp"   // for far_memory::Object used by the notifier
+
 
 using namespace far_memory;
 using std::cout;
 using std::endl;
 
+static std::atomic<uint64_t> wb_count{0};
+
 // Keep the “FakeDevice-level” simplicity and sizes similar to your array test.
-constexpr uint64_t kCacheSize    = (128ULL << 20); // 128 MB local cache
+constexpr uint64_t kCacheSize    = (1ULL << 20); // 128 MB local cache
 constexpr uint64_t kFarMemSize   = (4ULL  << 30);  // 4 GB far memory
 constexpr uint32_t kNumGCThreads = 12;
 
@@ -71,8 +76,7 @@ static void sanity_check(GraphAdj& G, const std::vector<std::pair<Vid,Vid>>& edg
   }
 }
 
-static void do_work(FarMemManager* manager,
-                    const GenParams& gen) {
+static void do_work(FarMemManager* manager, const GenParams& gen) {
   cout << "Running " << __FILE__ << "..." << endl;
 
   // Generate edges on host.
@@ -92,21 +96,26 @@ static void do_work(FarMemManager* manager,
 }
 
 static void _main(void* arg) {
-  // Build a FakeDevice-backed manager (like your array test).
   std::unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads,
                                   new FakeDevice(kFarMemSize)));
 
-  // Default: a moderate graph that exceeds cache with adjacency data.
-  // Tweak as needed (you can wire args later).
-  GenParams gen {
-    .num_vertices = 2000,   // 2M vertices
-    .num_edges    = 100000,  // 10M edges
-    .seed         = 42
-  };
+  // Count evictions (write-backs) for vanilla DSID objects
+  manager->register_eval_notifier(
+      kVanillaPtrDSID,
+      [&](far_memory::Object obj, FarMemManager::WriteObjectFn writeback)->bool {
+        wb_count.fetch_add(1, std::memory_order_relaxed);
+        writeback(obj.get_data_len());   // do normal write-back
+        return false;                    // we didn’t fully handle it
+      });
 
+  GenParams gen{ .num_vertices = 2000, .num_edges = 100000, .seed = 42 };
   do_work(manager.get(), gen);
+
+  std::cout << "Evicted objects (write-backs): "
+            << wb_count.load() << "\n";
 }
+
 
 int main(int argc, char* argv[]) {
   if (argc < 2) {
