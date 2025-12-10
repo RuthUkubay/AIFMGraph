@@ -106,7 +106,7 @@ public:
       }
     }
   }
-
+ 
   struct NeighborView {
     const Vid* ptr{nullptr};
     uint32_t   len{0};
@@ -146,3 +146,4 @@ private:
 };
 
 } // namespace far_memory
+//namegit add
