@@ -1,9 +1,7 @@
 // inc/graph_adj.hpp
 #pragma once
 
-extern "C" {
-#include <runtime/thread.h>
-}
+extern "C" { #include <runtime/thread.h> }
 
 #include "deref_scope.hpp"
 #include "pointer.hpp"
@@ -15,40 +13,33 @@ extern "C" {
 #include <utility>
 #include <cassert>
 #include <algorithm>
-#include <cstring>   // <-- for std::memset
+#include <cstring>
 
 namespace far_memory {
 
 using Vid = uint32_t;
 
-/* ---------- Placement policy (what stays inline vs remote) ---------- */
+/* Placement policy: how many neighbors to keep inline per vertex */
 struct RemotingPolicy {
   virtual ~RemotingPolicy() = default;
-  // return how many neighbors to keep inline in the header for this vertex
   virtual uint16_t inline_capacity(Vid u, uint32_t degree) const = 0;
 };
 
-/* ---------- Per-vertex header ---------- */
+/* Per-vertex header */
 struct VertexHdr {
   uint32_t degree{0};
-
-  // how many neighbors are kept inline (0..kInlineCap)
   uint16_t inline_len{0};
 
-  // small inline buffer to avoid a remote touch for tiny adjacency lists
   static constexpr uint16_t kInlineCap = 8;
-  Vid inline_small[kInlineCap]{};
-
-  // remote tail (degree - inline_len) * sizeof(Vid) bytes if any
-  mutable GenericUniquePtr tail;
+  Vid inline_small[kInlineCap]{};     // tiny adjacency in the header
+  mutable GenericUniquePtr tail;      // remaining neighbors, if any
 };
 
-/* ---------- Array of headers ---------- */
+/* Array of headers (one object per vertex) */
 class VertexArray : public GenericArray {
 public:
   inline VertexArray(FarMemManager* mgr, uint64_t n_vertices)
-      : GenericArray(mgr, /*item_size=*/sizeof(VertexHdr),
-                          /*num_items=*/n_vertices) {}
+      : GenericArray(mgr, sizeof(VertexHdr), n_vertices) {}
 
   inline GenericUniquePtr* slot(uint64_t i) { return at(false, i); }
   inline GenericUniquePtr* slot(uint64_t i) const {
@@ -57,7 +48,7 @@ public:
   inline uint64_t size() const { return kNumItems_; }
 };
 
-/* ---------- Graph: adjacency lists over AIFM ---------- */
+/* Graph: adjacency lists over AIFM */
 class GraphAdj {
 public:
   inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices,
@@ -69,38 +60,31 @@ public:
   inline void build_from_edges(const std::vector<std::pair<Vid, Vid>>& edges) {
     const uint64_t N = verts_.size();
 
-    // 1) host-side degree count
+    // 1) degree count
     std::vector<uint32_t> deg(N, 0);
     for (auto [u, v] : edges) { assert(u < N && v < N); ++deg[u]; }
 
-    // 2a) write header metadata, decide inline vs tail, allocate tail
+    // 2a) write headers & allocate tails
     {
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
         auto &vh = deref_vertex(scope, u);
 
-        // **Fix #1: zero the whole header to avoid stale bits**
+        // Full zero-init to avoid stale bits
         std::memset(&vh, 0, sizeof(VertexHdr));
 
         vh.degree = deg[u];
+        if (vh.degree == 0) continue;
 
-        if (vh.degree == 0) {
-          vh.inline_len = 0;
-          vh.tail = GenericUniquePtr{};
-          continue;
-        }
-
-        const uint16_t wish =
-            policy_.inline_capacity(static_cast<Vid>(u), vh.degree);
+        const uint16_t wish = policy_.inline_capacity((Vid)u, vh.degree);
         vh.inline_len = std::min<uint16_t>(wish, VertexHdr::kInlineCap);
 
         const uint32_t tail_deg = vh.degree - vh.inline_len;
         if (tail_deg > 0) {
-          const uint16_t bytes =
-              static_cast<uint16_t>(tail_deg * sizeof(Vid));
+          const uint16_t bytes = (uint16_t)(tail_deg * sizeof(Vid));
           vh.tail = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, bytes);
         } else {
-          vh.tail = GenericUniquePtr{}; // explicit empty
+          vh.tail = GenericUniquePtr{};
         }
       }
     }
@@ -116,11 +100,10 @@ public:
         if (cur[u] < vh.inline_len) {
           vh.inline_small[cur[u]++] = v;
         } else {
-          // **Defensive guard**: only write tail if it exists
           const uint32_t tail_idx = cur[u] - vh.inline_len;
           const uint32_t tail_deg = vh.degree - vh.inline_len;
           if (tail_deg > 0) {
-            auto *base = static_cast<uint8_t*>(vh.tail.deref_mut(scope));
+            auto *base = (uint8_t*)vh.tail.deref_mut(scope);
             reinterpret_cast<Vid*>(base)[tail_idx] = v;
           }
           ++cur[u];
@@ -141,13 +124,13 @@ public:
     NeighborView nv;
     nv.inline_ptr = vh.inline_small;
     nv.inline_len = vh.inline_len;
-    nv.tail_ptr   = nullptr;    // **Fix #2: always initialize**
+    nv.tail_ptr   = nullptr;
     nv.tail_len   = 0;
 
-    const uint32_t tail_deg =
-        (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
+    const uint32_t tail_deg = (vh.degree > vh.inline_len)
+                            ? (vh.degree - vh.inline_len) : 0;
     if (tail_deg > 0) {
-      const void *tail_base = vh.tail.deref(scope);  // safe only when tail exists
+      const void *tail_base = vh.tail.deref(scope);   // only if tail exists
       nv.tail_ptr = reinterpret_cast<const Vid*>(tail_base);
       nv.tail_len = tail_deg;
     }
@@ -164,26 +147,18 @@ public:
     return const_deref_vertex(scope, u).degree;
   }
 
-  /* ---- Prefetch helpers (PUBLIC) ---- */
-
-  // Sequential header prefetch: tell AIFM we’ll likely touch vertices
-  // [start, start+num) soon (stride=1).
+  /* Prefetch helpers */
   inline void prefetch_headers_span(uint64_t start, uint32_t num) {
     if (num == 0) return;
-    verts_.static_prefetch(/*start=*/start, /*step=*/1, /*num=*/num);
+    verts_.static_prefetch(start, /*step=*/1, num);
   }
 
-  // Hint: fetch the remote tail now (first touch) if it exists.
-  // NOTE: this does a real deref; use sparingly as a "warm" hint.
   inline void hint_tail_present(uint64_t u) {
     DerefScope s;
     const auto &vh = const_deref_vertex(s, u);
-    if (vh.degree > vh.inline_len) {
-      (void)vh.tail.deref(s); // bring tail into cache
-    }
+    if (vh.degree > vh.inline_len) (void)vh.tail.deref(s);
   }
 
-  // Convenience: enable a rolling static prefetch window over headers.
   inline void enable_header_static_prefetch(uint32_t distance) {
     if (distance == 0) return;
     verts_.static_prefetch(/*start=*/0, /*step=*/1, /*num=*/distance);
