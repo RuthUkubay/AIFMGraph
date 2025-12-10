@@ -136,6 +136,23 @@ public:
     }
     return nv;
   }
+  // --- add inside public: of GraphAdj (near other helpers) ---
+inline void warm_tail_prefix(uint64_t u, uint32_t k, DerefScope& scope) const {
+  const auto &vh = const_deref_vertex(scope, u);
+  const uint32_t tail_deg =
+      (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
+  if (tail_deg == 0 || k == 0) return;
+
+  const void *base = vh.tail.deref(scope);                 // map tail safely
+  const Vid *tp = reinterpret_cast<const Vid*>(base);
+
+  // Touch only a small prefix to initiate fetch; keep it bounded.
+  const uint32_t warm = (k < tail_deg) ? k : tail_deg;
+  volatile Vid sink = 0;
+  for (uint32_t i = 0; i < warm; ++i) sink ^= tp[i];
+  (void)sink;
+}
+
 
   /* Header info for stats / warm touches */
   struct HeaderInfo { uint32_t degree; uint16_t inline_len; };
