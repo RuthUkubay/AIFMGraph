@@ -34,6 +34,15 @@ struct Local8 : RemotingPolicy {
     return deg <= 8 ? deg : 0;
   }
 };
+struct Row {
+  const char* policy;
+  const char* variant;   // e.g., "baseline", "header(d=64)", "tailwarm(th=16)"
+  uint64_t inline_any;
+  uint64_t remote_any;
+  uint64_t remote_bytes;
+  double   bfs_us;
+};
+
 
 /* Banded generator: neighbors of u fall mostly in [u, u+W) */
 static std::vector<std::pair<Vid,Vid>>
@@ -159,15 +168,7 @@ static double bfs_time_us_tailwarm(GraphAdj &G, Vid src,
 }
 
 
-/* One run row */
-struct Row {
-  const char* policy;
-  const char* variant;   // "baseline" or "tailpeek(K)"
-  uint64_t inline_any;
-  uint64_t remote_any;
-  uint64_t remote_bytes;
-  double   bfs_us;
-};
+
 
 static Row run_case(FarMemManager* mgr,
                     const std::vector<std::pair<Vid,Vid>>& edges,
@@ -220,7 +221,7 @@ static Row run_case_tailwarm(FarMemManager* mgr,
                              uint32_t tail_threshold /* e.g., 16 */) {
   Row r{};
   r.policy   = policy_name;
-  r.prefetch = tail_threshold ? "tailwarm(th=16)" : "none";
+  r.variant = tail_threshold ? "tailwarm(th=16)" : "baseline";
 
   {
     GraphAdj G(mgr, /*N=*/0, pol); // dummy scope – ensures no premature alloc
@@ -270,27 +271,27 @@ static void _main(void*) {
   Local8    local_8;
 
     cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
-    cout << "Policy,Prefetch,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
+    cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
 
   // All-remote: baseline vs gated tail warm (th=16)
   {
     Row base = run_case(manager.get(), edges, "All-remote", all_remote, /*header_pf=*/0);
-    cout << base.policy << "," << base.prefetch << "," << base.inline_any << ","
+    cout << base.policy << "," << base.variant << "," << base.inline_any << ","
          << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
 
     Row warm = run_case_tailwarm(manager.get(), edges, "All-remote", all_remote, /*tail_threshold=*/16);
-    cout << warm.policy << "," << warm.prefetch << "," << warm.inline_any << ","
+    cout << warm.policy << "," << warm.variant << "," << warm.inline_any << ","
          << warm.remote_any << "," << warm.remote_bytes << "," << warm.bfs_us << "\n";
   }
 
   // Local-8: baseline vs gated tail warm (th=16)
   {
     Row base = run_case(manager.get(), edges, "Local-8", local_8, /*header_pf=*/0);
-    cout << base.policy << "," << base.prefetch << "," << base.inline_any << ","
+    cout << base.policy << "," << base.variant << "," << base.inline_any << ","
          << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
 
     Row warm = run_case_tailwarm(manager.get(), edges, "Local-8", local_8, /*tail_threshold=*/16);
-    cout << warm.policy << "," << warm.prefetch << "," << warm.inline_any << ","
+    cout << warm.policy << "," << warm.variant << "," << warm.inline_any << ","
          << warm.remote_any << "," << warm.remote_bytes << "," << warm.bfs_us << "\n";
   }
 

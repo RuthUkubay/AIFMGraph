@@ -152,6 +152,14 @@ inline void warm_tail_prefix(uint64_t u, uint32_t k, DerefScope& scope) const {
   for (uint32_t i = 0; i < warm; ++i) sink ^= tp[i];
   (void)sink;
 }
+inline void hint_tail_present(uint64_t u) const {
+    DerefScope s;
+    const auto &vh = const_deref_vertex(s, u);
+    if (vh.degree > vh.inline_len) {
+      (void)vh.tail.deref(s);
+    }
+  }
+
 
 
   /* Header info for stats / warm touches */
