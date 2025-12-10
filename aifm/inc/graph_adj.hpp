@@ -165,9 +165,13 @@ public:
   }
 
   inline void enable_header_static_prefetch(uint32_t distance) {
-    if (distance == 0) return;
+    // stride-1 scan; ‘distance’ lookahead
     verts_.static_prefetch(/*start=*/0, /*step=*/1, /*num=*/distance);
   }
+  inline void disable_header_prefetch() {
+  // cancel/disable any static prefetch configured on this array
+  verts_.disable_prefetch();
+}
 
 private:
   FarMemManager* mgr_{nullptr};

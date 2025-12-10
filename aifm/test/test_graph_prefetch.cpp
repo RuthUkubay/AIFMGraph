@@ -242,6 +242,9 @@ static void do_work(FarMemManager* mgr) {
     double us = 0.0;
     time_and_report(G, /*src=*/0, iters, cfg.pf_distance, cfg.tail_peek, us);
 
+    // NEW: be explicit — turn prefetch off before G is destroyed at end of scope
+    G.disable_header_prefetch();
+
     cout << cfg.name
          << " | inline_any=" << inline_any
          << " remote_any=" << remote_any
