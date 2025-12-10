@@ -25,7 +25,7 @@ constexpr uint64_t kCacheSize    = (128ULL << 20);
 constexpr uint64_t kFarMemSize   = (4ULL  << 30);
 constexpr uint32_t kNumGCThreads = 12;
 
-// ------------------- Placement policies -------------------
+/* ------------------- Placement policies ------------------- */
 struct AllRemote : RemotingPolicy {
   uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
 };
@@ -35,9 +35,9 @@ struct Local8 : RemotingPolicy {
   }
 };
 
-// ------------------- A graph with spatially local tails -------------------
+/* ------------------- A graph with spatially local tails ------------------- */
 // "Banded" generator: neighbors of u mostly sit in [u, u+W), making tails
-// contiguous-ish so prefetch/warm wins.
+// contiguous-ish so prefetch/warm can help.
 static std::vector<std::pair<Vid,Vid>>
 gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
   std::mt19937_64 rng(seed);
@@ -55,7 +55,20 @@ gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
   return edges;
 }
 
-// ------------------- BFS variants -------------------
+/* ------------------- RAII prefetch guard (scoped) ------------------- */
+struct PrefetchGuard {
+  GraphAdj &G;
+  bool armed;
+  explicit PrefetchGuard(GraphAdj &g, uint32_t distance)
+      : G(g), armed(distance > 0) {
+    if (armed) G.enable_header_static_prefetch(distance);
+  }
+  ~PrefetchGuard() {
+    if (armed) G.disable_header_prefetch();
+  }
+};
+
+/* ------------------- BFS variants ------------------- */
 
 // Baseline BFS: plain queue, no prefetch.
 static std::vector<int> bfs_baseline(GraphAdj &G, Vid src) {
@@ -83,9 +96,9 @@ static std::vector<int> bfs_baseline(GraphAdj &G, Vid src) {
 }
 
 // Header-prefetch BFS: process vertices in ascending ID per "level"
-// AND enable static prefetch on headers. This aligns with prefetcher’s stride.
+// AND enable static prefetch on headers.
 static std::vector<int> bfs_header_prefetch(GraphAdj &G, Vid src, uint32_t pf_dist) {
-  G.enable_header_static_prefetch(pf_dist);
+  PrefetchGuard guard(G, pf_dist);  // scoped: on enter/exit
 
   const uint64_t n = G.num_vertices();
   std::vector<int> dist(n, -1);
@@ -117,12 +130,11 @@ static std::vector<int> bfs_header_prefetch(GraphAdj &G, Vid src, uint32_t pf_di
   return dist;
 }
 
-// Header + tiny tail warmup: like above, but “peek” K tail entries to
-// initiate fetch without scanning the whole list.
+// Header + tiny tail warmup: like above, but “peek” K tail entries first.
 static std::vector<int> bfs_header_and_tail_warm(GraphAdj &G, Vid src,
                                                  uint32_t pf_dist,
                                                  uint32_t peek_k) {
-  G.enable_header_static_prefetch(pf_dist);
+  PrefetchGuard guard(G, pf_dist);  // scoped: on enter/exit
 
   const uint64_t n = G.num_vertices();
   std::vector<int> dist(n, -1);
@@ -139,7 +151,7 @@ static std::vector<int> bfs_header_and_tail_warm(GraphAdj &G, Vid src,
       DerefScope s;
       auto nv = G.neighbors(u, s);
 
-      // Warm a few tail entries (bounded) — cheap for banded tails.
+      // Warm a few tail entries (bounded).
       uint32_t warm = std::min(peek_k, nv.tail_len);
       for (uint32_t i = 0; i < warm; ++i) {
         volatile Vid tmp = nv.tail_ptr[i];
@@ -161,7 +173,7 @@ static std::vector<int> bfs_header_and_tail_warm(GraphAdj &G, Vid src,
   return dist;
 }
 
-// ------------------- Harness -------------------
+/* ------------------- Harness ------------------- */
 
 struct RunCfg {
   const char* name;
@@ -176,6 +188,7 @@ static void time_and_report(GraphAdj& G, Vid src,
                             uint32_t tail_peek,
                             double &out_us) {
   using clk = std::chrono::high_resolution_clock;
+
   // Warm
   (void)(pf_distance == 0 && tail_peek == 0
          ? bfs_baseline(G, src)
@@ -211,13 +224,13 @@ static void do_work(FarMemManager* mgr) {
   Local8    local_8;
 
   RunCfg runs[] = {
-    {"All-remote / baseline",              all_remote, 0,   0},
-    {"All-remote / header-pf(d=64)",       all_remote, 64,  0},
-    {"All-remote / header-pf+tail-peek(4)",all_remote, 64,  4},
+    {"All-remote / baseline",               all_remote, 0,   0},
+    {"All-remote / header-pf(d=64)",        all_remote, 64,  0},
+    {"All-remote / header-pf+tail-peek(4)", all_remote, 64,  4},
 
-    {"Local-8 / baseline",                  local_8,   0,   0},
-    {"Local-8 / header-pf(d=64)",           local_8,   64,  0},
-    {"Local-8 / header-pf+tail-peek(4)",    local_8,   64,  4},
+    {"Local-8 / baseline",                  local_8,    0,   0},
+    {"Local-8 / header-pf(d=64)",           local_8,    64,  0},
+    {"Local-8 / header-pf+tail-peek(4)",    local_8,    64,  4},
   };
 
   cout << "Graph: |V|=" << N << " |E|=" << E
@@ -241,9 +254,6 @@ static void do_work(FarMemManager* mgr) {
 
     double us = 0.0;
     time_and_report(G, /*src=*/0, iters, cfg.pf_distance, cfg.tail_peek, us);
-
-    // NEW: be explicit — turn prefetch off before G is destroyed at end of scope
-    G.disable_header_prefetch();
 
     cout << cfg.name
          << " | inline_any=" << inline_any
