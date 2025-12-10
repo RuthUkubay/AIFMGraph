@@ -71,7 +71,7 @@ public:
       for (uint64_t u = 0; u < N; ++u) {
         auto &vh = deref_vertex(scope, u);
 
-        // zero-init safely via value-init
+        // value-init (safe zeroing)
         vh = VertexHdr{};
 
         vh.degree = deg[u];
@@ -82,7 +82,8 @@ public:
 
         const uint32_t tail_deg = vh.degree - vh.inline_len;
         if (tail_deg > 0) {
-          const uint16_t bytes = static_cast<uint16_t>(tail_deg * sizeof(Vid));
+          const uint32_t bytes = tail_deg * static_cast<uint32_t>(sizeof(Vid));
+          // allocate with a 32-bit size to avoid truncation
           vh.tail = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, bytes);
         } else {
           vh.tail = GenericUniquePtr{};
@@ -153,7 +154,7 @@ public:
     const uint32_t tail_deg =
         (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
     if (tail_deg > 0) {
-      const void *base = vh.tail.deref(scope);              // const-safe deref
+      const void *base = vh.tail.deref(scope); // safe const deref
       const Vid *tp = reinterpret_cast<const Vid*>(base);
       for (uint32_t i = 0; i < tail_deg; ++i)
         fn(tp[i]);

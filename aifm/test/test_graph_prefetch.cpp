@@ -53,7 +53,7 @@ gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed=42) {
   return edges;
 }
 
-/* One BFS: uses for_each_neighbor (safe for all layouts) */
+/* BFS that uses the safe iterator API */
 static double bfs_time_us(GraphAdj &G, Vid src, uint32_t iters) {
   using clk = std::chrono::high_resolution_clock;
   const uint64_t n = G.num_vertices();
@@ -82,7 +82,7 @@ static double bfs_time_us(GraphAdj &G, Vid src, uint32_t iters) {
          / static_cast<double>(iters);
 }
 
-/* run one configuration safely */
+/* run one configuration safely (single construction; no dummy) */
 struct Row {
   const char* policy;
   const char* prefetch;
@@ -93,6 +93,7 @@ struct Row {
 };
 
 static Row run_case(FarMemManager* mgr,
+                    uint64_t N,
                     const std::vector<std::pair<Vid,Vid>>& edges,
                     const char* policy_name,
                     const RemotingPolicy& pol,
@@ -101,39 +102,29 @@ static Row run_case(FarMemManager* mgr,
   r.policy   = policy_name;
   r.prefetch = header_pf ? "header(d=64)" : "none";
 
-  {
-    GraphAdj G(mgr, /*N=*/0, pol); // will reset below (avoid early alloc)
-  }
+  // Build exactly once with the known N (no dummy object)
+  GraphAdj G(mgr, N, pol);
+  G.build_from_edges(edges);
 
-  // Build graph inside a tight scope so the object is destroyed after use
-  {
-    GraphAdj G(mgr, /*N=*/edges.empty()?0:(
-      [&](){ Vid maxv=0; for(auto &e:edges){ if (e.first>maxv) maxv=e.first; if (e.second>maxv) maxv=e.second; } return (uint64_t)maxv+1; }()
-    ), pol);
-
-    G.build_from_edges(edges);
-
-    // stats
-    const uint64_t N = G.num_vertices();
-    uint64_t inline_any=0, remote_any=0, remote_bytes=0;
-    for (uint64_t u = 0; u < N; ++u) {
-      DerefScope s;
-      auto h = G.header_info(u, s);
-      if (h.inline_len > 0) inline_any++;
-      if (h.degree > h.inline_len) {
-        remote_any++;
-        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
-      }
+  // stats
+  uint64_t inline_any=0, remote_any=0, remote_bytes=0;
+  for (uint64_t u = 0; u < N; ++u) {
+    DerefScope s;
+    auto h = G.header_info(u, s);
+    if (h.inline_len > 0) inline_any++;
+    if (h.degree > h.inline_len) {
+      remote_any++;
+      remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
     }
-    r.inline_any   = inline_any;
-    r.remote_any   = remote_any;
-    r.remote_bytes = remote_bytes;
-
-    if (header_pf) G.enable_header_static_prefetch(header_pf);
-    r.bfs_us = bfs_time_us(G, /*src=*/0, /*iters=*/5);
-    if (header_pf) G.disable_header_prefetch();
-    // G destroyed here before next case
   }
+  r.inline_any   = inline_any;
+  r.remote_any   = remote_any;
+  r.remote_bytes = remote_bytes;
+
+  if (header_pf) G.enable_header_static_prefetch(header_pf);
+  r.bfs_us = bfs_time_us(G, /*src=*/0, /*iters=*/5);
+  if (header_pf) G.disable_header_prefetch();
+
   return r;
 }
 
@@ -153,22 +144,24 @@ static void _main(void*) {
   cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
   cout << "Policy,Prefetch,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
 
-  // 1) two clear comparisons: all-remote w/wo header prefetch
+  // All-remote: no prefetch vs header prefetch
   {
-    Row a = run_case(manager.get(), edges, "All-remote", all_remote, 0);
+    Row a = run_case(manager.get(), N, edges, "All-remote", all_remote, 0);
     cout << a.policy << "," << a.prefetch << "," << a.inline_any << "," << a.remote_any
          << "," << a.remote_bytes << "," << a.bfs_us << "\n";
-    Row b = run_case(manager.get(), edges, "All-remote", all_remote, 64);
+
+    Row b = run_case(manager.get(), N, edges, "All-remote", all_remote, 64);
     cout << b.policy << "," << b.prefetch << "," << b.inline_any << "," << b.remote_any
          << "," << b.remote_bytes << "," << b.bfs_us << "\n";
   }
 
-  // 2) local-8 w/wo header prefetch
+  // Local-8: no prefetch vs header prefetch
   {
-    Row a = run_case(manager.get(), edges, "Local-8", local_8, 0);
+    Row a = run_case(manager.get(), N, edges, "Local-8", local_8, 0);
     cout << a.policy << "," << a.prefetch << "," << a.inline_any << "," << a.remote_any
          << "," << a.remote_bytes << "," << a.bfs_us << "\n";
-    Row b = run_case(manager.get(), edges, "Local-8", local_8, 64);
+
+    Row b = run_case(manager.get(), N, edges, "Local-8", local_8, 64);
     cout << b.policy << "," << b.prefetch << "," << b.inline_any << "," << b.remote_any
          << "," << b.remote_bytes << "," << b.bfs_us << "\n";
   }
