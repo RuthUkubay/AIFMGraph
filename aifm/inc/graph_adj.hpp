@@ -1,5 +1,8 @@
 #pragma once
-extern "C" { #include <runtime/thread.h> }
+
+extern "C" {
+#include <runtime/thread.h>
+}
 
 #include "deref_scope.hpp"
 #include "pointer.hpp"
@@ -16,8 +19,8 @@ namespace far_memory {
 using Vid = uint32_t;
 
 struct VertexHdr {
-  uint32_t        degree{0};
-  GenericUniquePtr nbrs;
+  uint32_t         degree{0};
+  GenericUniquePtr nbrs;    // null if degree==0
 };
 
 class VertexArray : public GenericArray {
@@ -41,13 +44,15 @@ public:
   inline void build_from_edges(const std::vector<std::pair<Vid,Vid>>& edges) {
     const uint64_t N = verts_.size();
 
+    // Phase 1: degree counts (host-side)
     std::vector<uint32_t> deg(N, 0);
     for (auto [u,v] : edges) { assert(u < N && v < N); ++deg[u]; }
 
+    // Phase 2: write headers + allocate adjacency arrays
     {
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
-        auto& vh = deref_vertex(scope, u);
+        auto& vh = deref_vertex(scope, u);        // MUTABLE header
         vh.degree = deg[u];
         if (vh.degree == 0) { vh.nbrs = GenericUniquePtr{}; continue; }
         const uint16_t bytes = static_cast<uint16_t>(vh.degree * sizeof(Vid));
@@ -55,13 +60,14 @@ public:
       }
     }
 
+    // Phase 3: fill neighbors
     std::vector<uint32_t> cur(N, 0);
     {
       DerefScope scope;
       for (auto [u,v] : edges) {
-        const auto& vh = const_deref_vertex(scope, u);
+        const auto& vh = const_deref_vertex(scope, u); // READ header
         if (vh.degree == 0) continue;
-        auto* base = static_cast<uint8_t*>(vh.nbrs.deref(scope));
+        auto* base = static_cast<uint8_t*>(vh.nbrs.deref_mut(scope)); // MUTATE array
         reinterpret_cast<Vid*>(base)[cur[u]++] = v;
       }
     }
@@ -70,9 +76,9 @@ public:
   struct NeighborView { const Vid* ptr{nullptr}; uint32_t len{0}; };
 
   inline NeighborView neighbors(uint64_t u, DerefScope& scope) const {
-    const auto& vh = const_deref_vertex(scope, u);
-    if (vh.degree == 0 || !vh.nbrs.valid()) return {nullptr, 0};
-    const auto* base = static_cast<const uint8_t*>(vh.nbrs.deref(scope));
+    const auto& vh = const_deref_vertex(scope, u);      // READ header
+    if (vh.degree == 0) return {nullptr, 0};
+    const auto* base = static_cast<const uint8_t*>(vh.nbrs.deref(scope)); // READ array
     return { reinterpret_cast<const Vid*>(base), vh.degree };
   }
 
@@ -85,11 +91,11 @@ private:
   VertexArray    verts_;
 
   inline VertexHdr& deref_vertex(const DerefScope& scope, uint64_t i) {
-    void* p = verts_.slot(i)->deref(scope);
+    void* p = verts_.slot(i)->deref_mut(scope);   // MUTABLE header
     return *reinterpret_cast<VertexHdr*>(p);
   }
   inline const VertexHdr& const_deref_vertex(const DerefScope& scope, uint64_t i) const {
-    const void* p = verts_.slot(i)->deref(scope);
+    const void* p = verts_.slot(i)->deref(scope); // READ-ONLY header
     return *reinterpret_cast<const VertexHdr*>(p);
   }
 };
