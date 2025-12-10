@@ -3,10 +3,10 @@ extern "C" {
 #include <runtime/runtime.h>
 }
 
-#include "device.hpp"    // FakeDevice
+#include "device.hpp"
 #include "manager.hpp"
 #include "deref_scope.hpp"
-#include "graph_adj.hpp" // your pointer-chasing graph header
+#include "graph_adj.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -15,91 +15,50 @@ extern "C" {
 #include <memory>
 #include <queue>
 #include <random>
-#include <unordered_set>
 #include <vector>
 
 using namespace far_memory;
 using std::cout;
 using std::endl;
 
-// ---- FarMem knobs (same flavor as your working tests) ----
-constexpr uint64_t kCacheSize    = (128ULL << 20); // 128 MB local cache
-constexpr uint64_t kFarMemSize   = (4ULL  << 30);  // 4 GB far memory
+constexpr uint64_t kCacheSize    = (128ULL << 20);
+constexpr uint64_t kFarMemSize   = (4ULL  << 30);
 constexpr uint32_t kNumGCThreads = 12;
 
-// ---- Policies (reuse your earlier shapes) ----
-struct AllRemotePolicy : RemotingPolicy {
+// ------------------- Placement policies -------------------
+struct AllRemote : RemotingPolicy {
   uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
 };
-struct Inline8Policy : RemotingPolicy {
+struct Local8 : RemotingPolicy {
   uint16_t inline_capacity(Vid, uint32_t deg) const override {
-    return deg <= 8 ? static_cast<uint16_t>(deg) : 0;
-  }
-};
-struct Inline16Policy : RemotingPolicy {
-  uint16_t inline_capacity(Vid, uint32_t deg) const override {
-    // "Wish" for 16; header caps at 8 internally.
-    return deg <= 16 ? static_cast<uint16_t>(deg) : 0;
+    return deg <= 8 ? deg : 0;
   }
 };
 
-// ---- Graph generator (single shared edge list for A/B/C) ----
-struct GenParams {
-  uint64_t num_vertices;
-  uint64_t num_edges;
-  uint64_t seed;
-};
-
+// ------------------- A graph with spatially local tails -------------------
+// "Banded" generator: neighbors of u mostly sit in [u, u+W), making tails
+// contiguous-ish so prefetch/warm wins.
 static std::vector<std::pair<Vid,Vid>>
-gen_random_edges(const GenParams& p) {
-  std::mt19937_64 rng(p.seed);
-  std::uniform_int_distribution<uint64_t> U(0, p.num_vertices - 1);
+gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<uint64_t> Uv(0, N - 1);
+  std::uniform_int_distribution<uint32_t> Uw(0, window - 1);
+
   std::vector<std::pair<Vid,Vid>> edges;
-  edges.reserve(p.num_edges);
-  for (uint64_t i = 0; i < p.num_edges; ++i) {
-    Vid u = static_cast<Vid>(U(rng));
-    Vid v = static_cast<Vid>(U(rng));
-    if (u == v) v = (u + 1 < p.num_vertices) ? u + 1 : 0; // avoid self-loop
+  edges.reserve(E);
+  for (uint64_t i = 0; i < E; ++i) {
+    Vid u = static_cast<Vid>(Uv(rng));
+    Vid v = static_cast<Vid>((u + Uw(rng)) % N); // keep neighbors near u
+    if (v == u) v = (u + 1) % N;
     edges.emplace_back(u, v);
   }
   return edges;
 }
 
-// ---- Placement stats (same definition you used) ----
-struct PlacementStats {
-  uint64_t verts_inline_any = 0;
-  uint64_t verts_remote_any = 0;
-  uint64_t bytes_remote     = 0;
-};
+// ------------------- BFS variants -------------------
 
-static PlacementStats
-measure_placement(GraphAdj& G) {
-  PlacementStats st{};
-  const uint64_t N = G.num_vertices();
-  for (uint64_t u = 0; u < N; ++u) {
-    DerefScope s;
-    auto h = G.header_info(u, s);
-    if (h.inline_len > 0) st.verts_inline_any++;
-    if (h.degree > h.inline_len) {
-      st.verts_remote_any++;
-      st.bytes_remote += (h.degree - h.inline_len) * sizeof(Vid);
-    }
-  }
-  return st;
-}
-
-static void print_stats(const char* name, const PlacementStats& st, uint64_t N) {
-  cout << "[" << name << "] vertices=" << N
-       << " inline_any=" << st.verts_inline_any
-       << " remote_any=" << st.verts_remote_any
-       << " bytes_remote=" << st.bytes_remote
-       << "\n";
-}
-
-// ===== Traversal modes =====
-
-// Mode 1: Baseline BFS (no prefetch)
-static std::vector<int> bfs_baseline(GraphAdj& G, Vid src) {
+// Baseline BFS: plain queue, no prefetch.
+static std::vector<int> bfs_baseline(GraphAdj &G, Vid src) {
   const uint64_t n = G.num_vertices();
   std::vector<int> dist(n, -1);
   if (src >= n) return dist;
@@ -123,36 +82,11 @@ static std::vector<int> bfs_baseline(GraphAdj& G, Vid src) {
   return dist;
 }
 
-// Utility: prefetch headers for a set of vertices by coalescing contiguous IDs
-static void prefetch_headers_for_set(GraphAdj& G, std::vector<Vid>& ids) {
-  if (ids.empty()) return;
-  std::sort(ids.begin(), ids.end());
-  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+// Header-prefetch BFS: process vertices in ascending ID per "level"
+// AND enable static prefetch on headers. This aligns with prefetcher’s stride.
+static std::vector<int> bfs_header_prefetch(GraphAdj &G, Vid src, uint32_t pf_dist) {
+  G.enable_header_static_prefetch(pf_dist);
 
-  // Emit sequential spans to the prefetcher (stride = 1)
-  uint64_t run_start = ids[0];
-  uint64_t prev = ids[0];
-  uint32_t run_len = 1;
-
-  auto flush_run = [&](void) {
-    G.prefetch_headers_span(run_start, run_len);
-  };
-
-  for (size_t i = 1; i < ids.size(); ++i) {
-    if (ids[i] == prev + 1) {
-      ++run_len; prev = ids[i];
-    } else {
-      flush_run();
-      run_start = prev = ids[i];
-      run_len = 1;
-    }
-  }
-  flush_run();
-}
-
-// Mode 2: BFS with level-wise header prefetch.
-// We collect the next wave of vertices, prefetch their headers before descending.
-static std::vector<int> bfs_header_prefetch(GraphAdj& G, Vid src) {
   const uint64_t n = G.num_vertices();
   std::vector<int> dist(n, -1);
   if (src >= n) return dist;
@@ -161,35 +95,35 @@ static std::vector<int> bfs_header_prefetch(GraphAdj& G, Vid src) {
   curr.reserve(1024); next.reserve(1024);
   dist[src] = 0; curr.push_back(src);
 
-  int depth = 0;
   while (!curr.empty()) {
-    // Discover next
-    next.clear();
+    // Make header access nearly sequential → helps static prefetch.
+    std::sort(curr.begin(), curr.end());
+
     for (Vid u : curr) {
       DerefScope s;
       auto nv = G.neighbors(u, s);
       for (uint32_t i = 0; i < nv.inline_len; ++i) {
         Vid v = nv.inline_ptr[i];
-        if (dist[v] == -1) { dist[v] = depth + 1; next.push_back(v); }
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
       }
       for (uint32_t i = 0; i < nv.tail_len; ++i) {
         Vid v = nv.tail_ptr[i];
-        if (dist[v] == -1) { dist[v] = depth + 1; next.push_back(v); }
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
       }
     }
-
-    // Prefetch headers for 'next' before processing it
-    prefetch_headers_for_set(G, next);
-
     curr.swap(next);
-    ++depth;
+    next.clear();
   }
   return dist;
 }
 
-// Mode 3: BFS with header prefetch + tail warm hints under a budget.
-// We prefetch headers for the whole next wave, then "warm" tails for the first K vertices.
-static std::vector<int> bfs_header_and_tail(GraphAdj& G, Vid src, size_t tail_hint_budget = 8192) {
+// Header + tiny tail warmup: like above, but “peek” K tail entries to
+// initiate fetch without scanning the whole list.
+static std::vector<int> bfs_header_and_tail_warm(GraphAdj &G, Vid src,
+                                                 uint32_t pf_dist,
+                                                 uint32_t peek_k) {
+  G.enable_header_static_prefetch(pf_dist);
+
   const uint64_t n = G.num_vertices();
   std::vector<int> dist(n, -1);
   if (src >= n) return dist;
@@ -198,108 +132,134 @@ static std::vector<int> bfs_header_and_tail(GraphAdj& G, Vid src, size_t tail_hi
   curr.reserve(1024); next.reserve(1024);
   dist[src] = 0; curr.push_back(src);
 
-  int depth = 0;
   while (!curr.empty()) {
-    next.clear();
+    std::sort(curr.begin(), curr.end());
+
     for (Vid u : curr) {
       DerefScope s;
       auto nv = G.neighbors(u, s);
+
+      // Warm a few tail entries (bounded) — cheap for banded tails.
+      uint32_t warm = std::min(peek_k, nv.tail_len);
+      for (uint32_t i = 0; i < warm; ++i) {
+        volatile Vid tmp = nv.tail_ptr[i];
+        (void)tmp;
+      }
+
       for (uint32_t i = 0; i < nv.inline_len; ++i) {
         Vid v = nv.inline_ptr[i];
-        if (dist[v] == -1) { dist[v] = depth + 1; next.push_back(v); }
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
       }
       for (uint32_t i = 0; i < nv.tail_len; ++i) {
         Vid v = nv.tail_ptr[i];
-        if (dist[v] == -1) { dist[v] = depth + 1; next.push_back(v); }
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
       }
     }
-
-    // Prefetch all headers in the next wave.
-    prefetch_headers_for_set(G, next);
-
-    // Warm a fraction of tails (budgeted) to hide first-touch stalls.
-    // We just take the first few unique IDs from 'next' after de-dup.
-    std::vector<Vid> uniq = next;
-    std::sort(uniq.begin(), uniq.end());
-    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-    size_t warmed = 0;
-    for (Vid v : uniq) {
-      if (warmed >= tail_hint_budget) break;
-      G.hint_tail_present(v);
-      ++warmed;
-    }
-
     curr.swap(next);
-    ++depth;
+    next.clear();
   }
   return dist;
 }
 
-// ---- Timing harness ----
-template <typename Fn>
-static uint64_t time_us(Fn&& f, int iters) {
+// ------------------- Harness -------------------
+
+struct RunCfg {
+  const char* name;
+  const RemotingPolicy& pol;
+  uint32_t pf_distance; // 0 = no prefetch
+  uint32_t tail_peek;   // 0 = no tail warm
+};
+
+static void time_and_report(GraphAdj& G, Vid src,
+                            uint32_t iters,
+                            uint32_t pf_distance,
+                            uint32_t tail_peek,
+                            double &out_us) {
   using clk = std::chrono::high_resolution_clock;
-  auto warm = f(); (void)warm;
+  // Warm
+  (void)(pf_distance == 0 && tail_peek == 0
+         ? bfs_baseline(G, src)
+         : (tail_peek == 0 ? bfs_header_prefetch(G, src, pf_distance)
+                           : bfs_header_and_tail_warm(G, src, pf_distance, tail_peek)));
+
   auto t0 = clk::now();
-  for (int i = 0; i < iters; ++i) (void)f();
+  for (uint32_t i = 0; i < iters; ++i) {
+    if (pf_distance == 0 && tail_peek == 0) {
+      (void)bfs_baseline(G, src);
+    } else if (tail_peek == 0) {
+      (void)bfs_header_prefetch(G, src, pf_distance);
+    } else {
+      (void)bfs_header_and_tail_warm(G, src, pf_distance, tail_peek);
+    }
+  }
   auto t1 = clk::now();
-  return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  out_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+           / static_cast<double>(iters);
 }
 
-// ---- Driver: build per policy, then run modes ----
-static void run_suite(FarMemManager* manager) {
-  GenParams gen { .num_vertices = 200000, .num_edges = 1200000, .seed = 1234 };
-  auto edges = gen_random_edges(gen);
-  cout << "Graph: |V|=" << gen.num_vertices << " |E|=" << edges.size() << "\n";
+static void do_work(FarMemManager* mgr) {
+  // Make a workload where prefetch can help:
+  // - banded tails → spatial locality
+  // - level-sorted BFS → header stride = 1
+  const uint64_t N = 200000;
+  const uint64_t E = 1200000;
+  const uint32_t W = 64;     // band window (neighbors near u)
+  const uint32_t iters = 5;
+  auto edges = gen_banded_edges(N, E, W);
 
-  struct {
-    const char* name;
-    RemotingPolicy* pol;
-  } cases[] = {
-    {"all_remote",      new AllRemotePolicy()},
-    {"inline_8",        new Inline8Policy()},
-    {"inline_16_cap8",  new Inline16Policy()},
+  AllRemote all_remote;
+  Local8    local_8;
+
+  RunCfg runs[] = {
+    {"All-remote / baseline",              all_remote, 0,   0},
+    {"All-remote / header-pf(d=64)",       all_remote, 64,  0},
+    {"All-remote / header-pf+tail-peek(4)",all_remote, 64,  4},
+
+    {"Local-8 / baseline",                  local_8,   0,   0},
+    {"Local-8 / header-pf(d=64)",           local_8,   64,  0},
+    {"Local-8 / header-pf+tail-peek(4)",    local_8,   64,  4},
   };
 
-  const int iters = 5;
+  cout << "Graph: |V|=" << N << " |E|=" << E
+       << " (banded window=" << W << ")\n";
 
-  for (auto &C : cases) {
-    GraphAdj G(manager, gen.num_vertices, *C.pol);
+  for (auto &cfg : runs) {
+    GraphAdj G(mgr, N, cfg.pol);
     G.build_from_edges(edges);
-    auto st = measure_placement(G);
-    print_stats(C.name, st, gen.num_vertices);
 
-    auto t0 = time_us([&]{ return bfs_baseline(G, 0); }, iters);
-    auto t1 = time_us([&]{ return bfs_header_prefetch(G, 0); }, iters);
-    auto t2 = time_us([&]{ return bfs_header_and_tail(G, 0, /*tail_hint_budget=*/4096); }, iters);
+    // layout stats
+    uint64_t remote_bytes = 0, inline_any = 0, remote_any = 0;
+    for (uint64_t u = 0; u < N; ++u) {
+      DerefScope s;
+      auto h = G.header_info(u, s);
+      if (h.inline_len > 0) inline_any++;
+      if (h.degree > h.inline_len) {
+        remote_any++;
+        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
+      }
+    }
 
-    cout << "BFS[" << C.name << "]  "
-         << "baseline_us=" << (double)t0/iters
-         << " | header_pf_us=" << (double)t1/iters
-         << " | header+tail_pf_us=" << (double)t2/iters
-         << "\n";
+    double us = 0.0;
+    time_and_report(G, /*src=*/0, iters, cfg.pf_distance, cfg.tail_peek, us);
 
-    delete C.pol;
+    cout << cfg.name
+         << " | inline_any=" << inline_any
+         << " remote_any=" << remote_any
+         << " remote_bytes=" << remote_bytes
+         << " | BFS per-iter (µs)=" << us << "\n";
   }
   cout << "Done.\n";
 }
 
-// ---- Shenango/AIFM glue ----
 static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
-  run_suite(manager.get());
+  do_work(manager.get());
 }
 
 int main(int argc, char* argv[]) {
-  if (argc < 2) {
-    std::cerr << "usage: " << argv[0] << " [cfg_file]\n";
-    return -EINVAL;
-  }
+  if (argc < 2) { std::cerr << "usage: " << argv[0] << " [cfg_file]\n"; return -EINVAL; }
   int ret = runtime_init(argv[1], _main, nullptr);
-  if (ret) {
-    std::cerr << "failed to start runtime\n";
-    return ret;
-  }
+  if (ret) { std::cerr << "failed to start runtime\n"; return ret; }
   return 0;
 }

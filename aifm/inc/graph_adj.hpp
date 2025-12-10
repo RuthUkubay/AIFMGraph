@@ -162,6 +162,13 @@ public:
       (void)vh.tail.deref(s); // bring tail into cache
     }
   }
+  // Tell AIFM's GenericArray prefetcher that we will scan headers (u, u+1, ...)
+inline void enable_header_static_prefetch(uint32_t distance) {
+  // start at 0, step = 1 vertex each time, prefetch 'distance' future headers
+  verts_.static_prefetch(/*start=*/std::make_tuple(0ULL),
+                         /*step=*/ std::make_tuple(1ULL),
+                         /*num=*/  distance);
+}
 
 
 private:
