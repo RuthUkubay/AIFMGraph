@@ -1,7 +1,11 @@
 // inc/graph_adj.hpp
 #pragma once
 
-extern "C" { #include <runtime/thread.h> }
+extern "C" {
+#include <runtime/thread.h>
+}
+
+#include <cstring> // for std::memset
 
 #include "deref_scope.hpp"
 #include "pointer.hpp"
