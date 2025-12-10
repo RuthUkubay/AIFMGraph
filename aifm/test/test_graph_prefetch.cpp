@@ -232,6 +232,49 @@ static inline void bin_frontier(std::vector<Vid>& curr,
   curr.swap(tmp);
 }
 
+// BFS with optional tiny tail prefetch and tunable per-edge compute.
+static double bfs_time_us_with_work(GraphAdj &G, Vid src,
+                                    uint32_t iters,
+                                    uint32_t peek_k,      // 0 = no tailpeek
+                                    uint32_t edge_work) { // 0 = no extra work
+  using clk = std::chrono::high_resolution_clock;
+  const uint64_t n = G.num_vertices();
+  if (src >= n) return 0.0;
+
+  auto run_once = [&](){
+    std::vector<int> dist(n, -1);
+    std::queue<Vid> q;
+    volatile uint32_t sink = 0;     // accumulates "work" to avoid DCE
+    dist[src] = 0; q.push(src);
+
+    while (!q.empty()) {
+      Vid u = q.front(); q.pop();
+      DerefScope s;
+
+      if (peek_k) {
+        // Warm a tiny prefix of the tail *right before* using it.
+        G.warm_tail_prefix(u, peek_k, s);
+      }
+
+      G.for_each_neighbor(u, s, [&](Vid v){
+        // Do the same compute amount irrespective of visited-ness
+        // so comparisons are apples-to-apples across variants.
+        do_edge_work(sink, v, edge_work);
+
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+      });
+    }
+  };
+
+  // Warm run
+  run_once();
+  auto t0 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) run_once();
+  auto t1 = clk::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+         / static_cast<double>(iters);
+}
+
 
 // Adaptive frontier-sort: only sort a level when it's big AND tail-heavy
 static double bfs_frontier_sort_adaptive_time_us(GraphAdj &G, Vid src,
@@ -373,6 +416,45 @@ static Row run_case(FarMemManager* mgr,
 
   return r;
 }
+
+static Row run_case_with_work(FarMemManager* mgr,
+                              const std::vector<std::pair<Vid,Vid>>& edges,
+                              const char* policy_name,
+                              const RemotingPolicy& pol,
+                              uint32_t peek_k,            // 0 = baseline, else tailpeek(K)
+                              uint32_t edge_work) {
+  Row r{};
+  r.policy  = policy_name;
+  r.variant = (peek_k == 0) ? "baseline" : (peek_k == 1 ? "tailpeek(1)" :
+                                            (peek_k == 2 ? "tailpeek(2)" : "tailpeek(?)"));
+
+  // infer N
+  uint64_t N = 0;
+  for (auto &e : edges) N = std::max<uint64_t>(N, std::max<uint64_t>(e.first, e.second));
+  N += 1;
+
+  GraphAdj G(mgr, N, pol);
+  G.build_from_edges(edges);
+
+  // placement stats
+  uint64_t inline_any=0, remote_any=0, remote_bytes=0;
+  for (uint64_t u = 0; u < N; ++u) {
+    DerefScope s;
+    auto h = G.header_info(u, s);
+    if (h.inline_len > 0) inline_any++;
+    if (h.degree > h.inline_len) {
+      remote_any++;
+      remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
+    }
+  }
+  r.inline_any   = inline_any;
+  r.remote_any   = remote_any;
+  r.remote_bytes = remote_bytes;
+
+  r.bfs_us = bfs_time_us_with_work(G, /*src=*/0, /*iters=*/5, /*peek_k=*/peek_k, /*edge_work=*/edge_work);
+  return r;
+}
+ 
 static Row run_case_tailwarm(FarMemManager* mgr,
                              const std::vector<std::pair<Vid,Vid>>& edges,
                              const char* policy_name,
@@ -431,88 +513,46 @@ static void _main(void*) {
   Local8    local_8;
 
   cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
-  cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
+    cout << "Policy,Variant,EdgeWorkIters,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,"
+            "BFS per-iter (µs),Speedup vs baseline (same EdgeWork)\n";
 
-  // ---- Baselines (no sorting) ----
-  {
-    Row base = run_case(manager.get(), edges, "All-remote", all_remote, /*peek_k=*/0);
-    cout << base.policy << "," << base.variant << "," << base.inline_any << ","
-         << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
-  }
-  {
-    Row base = run_case(manager.get(), edges, "Local-8", local_8, /*peek_k=*/0);
-    cout << base.policy << "," << base.variant << "," << base.inline_any << ","
-         << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
-  }
+    const uint32_t work_levels[] = {0, 64, 256};    // try no work, light work, heavier work
+    const uint32_t tailpeeks[]   = {0, 1, 2};       // baseline, tailpeek(1), tailpeek(2)
 
-  // ---- Adaptive frontier sort (only when frontier large & tails heavy) ----
-    const uint32_t kSortMinFrontier = 20000; // was 4096
-    const uint32_t kTailThreshold   = 128;   // was 64
-    // ADD THIS ONE-LINER so we can verify the run-time knobs:
-   std::cout << "frontier-bin(adaptive f>=" << kSortMinFrontier
-            << " tail>=" << kTailThreshold << ")\n";
+    for (uint32_t work : work_levels) {
+    // --- All-remote group ---
+    Row base = run_case_with_work(manager.get(), edges, "All-remote", all_remote, /*peek_k=*/0, work);
+    cout << base.policy << "," << base.variant << "," << work << ","
+        << base.inline_any << "," << base.remote_any << ","
+        << base.remote_bytes << "," << base.bfs_us << ",—\n";
 
-  // All-remote (adaptive)
-  {
-    // infer N from edges
-    uint64_t Nmax = 0;
-    for (auto &e : edges)
-      Nmax = std::max<uint64_t>(Nmax, std::max<uint64_t>(e.first, e.second));
-    GraphAdj G(manager.get(), Nmax + 1, all_remote);
-    G.build_from_edges(edges);
-
-    // stats (for table)
-    uint64_t inline_any=0, remote_any=0, remote_bytes=0;
-    for (uint64_t u = 0; u < G.num_vertices(); ++u) {
-      DerefScope s;
-      auto h = G.header_info(u, s);
-      if (h.inline_len > 0) inline_any++;
-      if (h.degree > h.inline_len) {
-        remote_any++;
-        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
-      }
+    for (uint32_t pk : {1u, 2u}) {
+        Row r = run_case_with_work(manager.get(), edges, "All-remote", all_remote, pk, work);
+        double speedup = (base.bfs_us > 0) ? (1.0 - (r.bfs_us / base.bfs_us)) * 100.0 : 0.0;
+        cout << r.policy << "," << r.variant << "," << work << ","
+            << r.inline_any << "," << r.remote_any << ","
+            << r.remote_bytes << "," << r.bfs_us << ","
+            << (speedup >= 0 ? "+" : "") << speedup << "%\n";
     }
 
-    double us = bfs_frontier_sort_adaptive_time_us(G, /*src=*/0,
-                                                   kSortMinFrontier, kTailThreshold,
-                                                   /*iters=*/5);
+    // --- Local-8 group ---
+    Row baseL = run_case_with_work(manager.get(), edges, "Local-8", local_8, /*peek_k=*/0, work);
+    cout << baseL.policy << "," << baseL.variant << "," << work << ","
+        << baseL.inline_any << "," << baseL.remote_any << ","
+        << baseL.remote_bytes << "," << baseL.bfs_us << ",—\n";
 
-    cout << "All-remote,frontier-bin(adaptive f>=" << kSortMinFrontier
-     << " tail>=" << kTailThreshold << "),"
-     << inline_any << "," << remote_any << "," << remote_bytes << ","
-     << us << "\n";
-  }
-
-  // Local-8 (adaptive)
-  {
-    uint64_t Nmax = 0;
-    for (auto &e : edges)
-      Nmax = std::max<uint64_t>(Nmax, std::max<uint64_t>(e.first, e.second));
-    GraphAdj G(manager.get(), Nmax + 1, local_8);
-    G.build_from_edges(edges);
-
-    uint64_t inline_any=0, remote_any=0, remote_bytes=0;
-    for (uint64_t u = 0; u < G.num_vertices(); ++u) {
-      DerefScope s;
-      auto h = G.header_info(u, s);
-      if (h.inline_len > 0) inline_any++;
-      if (h.degree > h.inline_len) {
-        remote_any++;
-        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
-      }
+    for (uint32_t pk : {1u, 2u}) {
+        Row r = run_case_with_work(manager.get(), edges, "Local-8", local_8, pk, work);
+        double speedup = (baseL.bfs_us > 0) ? (1.0 - (r.bfs_us / baseL.bfs_us)) * 100.0 : 0.0;
+        cout << r.policy << "," << r.variant << "," << work << ","
+            << r.inline_any << "," << r.remote_any << ","
+            << r.remote_bytes << "," << r.bfs_us << ","
+            << (speedup >= 0 ? "+" : "") << speedup << "%\n";
+    }
     }
 
-    double us = bfs_frontier_sort_adaptive_time_us(G, /*src=*/0,
-                                                   kSortMinFrontier, kTailThreshold,
-                                                   /*iters=*/5);
+    cout << "Done.\n";
 
-    cout << "Local-8,frontier-bin(adaptive f>=" << kSortMinFrontier
-     << " tail>=" << kTailThreshold << "),"
-     << inline_any << "," << remote_any << "," << remote_bytes << ","
-     << us << "\n";
-  }
-
-  cout << "Done.\n";
 }
 
 int main(int argc, char* argv[]) {
