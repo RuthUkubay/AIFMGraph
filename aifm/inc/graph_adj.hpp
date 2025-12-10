@@ -13,137 +13,152 @@ extern "C" {
 #include <vector>
 #include <utility>
 #include <cassert>
+#include <algorithm>
 
 namespace far_memory {
 
-// Compact vertex id
 using Vid = uint32_t;
 
-/**
- * Per-vertex header kept in local cache when hot.
- * degree : number of neighbors
- * nbrs   : remoteable byte array holding 'degree' Vid entries (contiguous)
- *
- * 'nbrs' is marked mutable so we can call .deref() from const methods
- * (the handle's deref is non-const, but it produces a const void* for reads).
- */
-struct VertexHdr {
-  uint32_t               degree{0};
-  mutable GenericUniquePtr nbrs;
+/* ---------- Placement policy (what stays inline vs remote) ---------- */
+struct RemotingPolicy {
+  virtual ~RemotingPolicy() = default;
+  // return how many neighbors to keep inline in the header for this vertex
+  virtual uint16_t inline_capacity(Vid u, uint32_t degree) const = 0;
 };
 
-/**
- * Thin wrapper over GenericArray to store VertexHdr in far-mem objects,
- * one object per vertex. Each slot() returns the handle to that object.
- */
+/* ---------- Per-vertex header ---------- */
+struct VertexHdr {
+  uint32_t degree{0};
+
+  // how many neighbors are kept inline (0..kInlineCap)
+  uint16_t inline_len{0};
+
+  // small inline buffer to avoid a remote touch for tiny adjacency lists
+  static constexpr uint16_t kInlineCap = 8;
+  Vid inline_small[kInlineCap]{};
+
+  // remote tail (degree - inline_len) * sizeof(Vid) bytes if any
+  mutable GenericUniquePtr tail;
+};
+
+/* ---------- Array of headers ---------- */
 class VertexArray : public GenericArray {
 public:
   inline VertexArray(FarMemManager* mgr, uint64_t n_vertices)
     : GenericArray(mgr, /*item_size=*/sizeof(VertexHdr),
                         /*num_items=*/n_vertices) {}
 
-  // Non-const context: return the handle directly.
   inline GenericUniquePtr* slot(uint64_t i) { return at(false, i); }
-
-  // Const context: still return a non-const handle so we can call deref().
   inline GenericUniquePtr* slot(uint64_t i) const {
     return const_cast<VertexArray*>(this)->at(false, i);
   }
-
   inline uint64_t size() const { return kNumItems_; }
 };
 
-/**
- * GraphAdj: adjacency-list graph over AIFM.
- * Layout: one VertexHdr object per vertex; its 'nbrs' points to a remoteable
- * byte array of neighbor Vids.
- */
+/* ---------- Graph: adjacency lists over AIFM ---------- */
 class GraphAdj {
 public:
-  inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices)
-      : mgr_(mgr), verts_(mgr, n_vertices) {}
+  inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices,
+                  const RemotingPolicy& policy)
+      : mgr_(mgr), policy_(policy), verts_(mgr, n_vertices) {}
 
   inline uint64_t num_vertices() const { return verts_.size(); }
 
-  /**
-   * Build from edge list (directed). Assumes vertices are in [0, N).
-   * Two-pass: (1) count degrees, (2) allocate & fill neighbor arrays.
-   */
   inline void build_from_edges(const std::vector<std::pair<Vid, Vid>>& edges) {
     const uint64_t N = verts_.size();
 
-    // Pass 1: host-side degree counts
+    // 1) host-side degree count
     std::vector<uint32_t> deg(N, 0);
-    for (auto [u, v] : edges) {
-      assert(u < N && v < N);
-      ++deg[u];
-    }
+    for (auto [u, v] : edges) { assert(u < N && v < N); ++deg[u]; }
 
-    // Pass 2a: write headers & allocate neighbor arrays
+    // 2a) write header metadata, decide inline vs tail, allocate tail
     {
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
-        auto& vh = deref_vertex(scope, u);  // mutable header mapping
+        auto &vh = deref_vertex(scope, u);
         vh.degree = deg[u];
-        if (vh.degree == 0) {
-          vh.nbrs = GenericUniquePtr{};     // empty
-          continue;
+        vh.inline_len = 0;
+        vh.tail = GenericUniquePtr{};
+
+        if (vh.degree == 0) continue;
+
+        const uint16_t wish =
+          policy_.inline_capacity(static_cast<Vid>(u), vh.degree);
+        vh.inline_len = std::min<uint16_t>(wish, VertexHdr::kInlineCap);
+
+        const uint32_t tail_deg = vh.degree - vh.inline_len;
+        if (tail_deg > 0) {
+          const uint16_t bytes = static_cast<uint16_t>(tail_deg * sizeof(Vid));
+          vh.tail = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, bytes);
         }
-        const uint16_t bytes = static_cast<uint16_t>(vh.degree * sizeof(Vid));
-        vh.nbrs = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, bytes);
       }
     }
 
-    // Pass 2b: fill neighbor arrays
+    // 2b) fill inline then tail
     std::vector<uint32_t> cur(N, 0);
     {
       DerefScope scope;
       for (auto [u, v] : edges) {
-        auto& vh = deref_vertex(scope, u); // mutable header -> can deref_mut
+        auto &vh = deref_vertex(scope, u);
         if (vh.degree == 0) continue;
-        auto* base = static_cast<uint8_t*>(vh.nbrs.deref_mut(scope));
-        reinterpret_cast<Vid*>(base)[cur[u]++] = v;
+        if (cur[u] < vh.inline_len) {
+          vh.inline_small[cur[u]++] = v;
+        } else {
+          auto *base = static_cast<uint8_t*>(vh.tail.deref_mut(scope));
+          reinterpret_cast<Vid*>(base)[cur[u] - vh.inline_len] = v;
+          ++cur[u];
+        }
       }
     }
   }
- 
+
   struct NeighborView {
-    const Vid* ptr{nullptr};
-    uint32_t   len{0};
+    const Vid* inline_ptr{nullptr};
+    uint32_t   inline_len{0};
+    const Vid* tail_ptr{nullptr};
+    uint32_t   tail_len{0};
   };
 
-  /** Read-only neighbor view for vertex u (valid while 'scope' lives). */
   inline NeighborView neighbors(uint64_t u, DerefScope& scope) const {
-    const auto& vh = const_deref_vertex(scope, u);   // read header
-    if (vh.degree == 0) return {nullptr, 0};
-    // In a const method we still need a non-const handle to call deref().
-    auto* h = verts_.slot(u);
-    const auto* base = static_cast<const uint8_t*>(h->deref(scope));
-    return { reinterpret_cast<const Vid*>(base), vh.degree };
+    const auto &vh = const_deref_vertex(scope, u);
+    NeighborView nv;
+    nv.inline_ptr = vh.inline_small;
+    nv.inline_len = vh.inline_len;
+    if (vh.degree > vh.inline_len) {
+      auto *h = verts_.slot(u); // need handle to deref tail
+      const auto *base = static_cast<const uint8_t*>(h->deref(scope));
+      // base points to header; the tail pointer is in vh.tail
+      const auto *tail_base = static_cast<const uint8_t*>(vh.tail.deref(scope));
+      nv.tail_ptr = reinterpret_cast<const Vid*>(tail_base);
+      nv.tail_len = vh.degree - vh.inline_len;
+    }
+    return nv;
   }
 
-  /** Degree of vertex u. */
+  struct HeaderInfo { uint32_t degree; uint16_t inline_len; };
+  inline HeaderInfo header_info(uint64_t u, DerefScope &scope) const {
+    const auto &vh = const_deref_vertex(scope, u);
+    return HeaderInfo{vh.degree, vh.inline_len};
+  }
+
   inline uint32_t degree(uint64_t u, DerefScope& scope) const {
     return const_deref_vertex(scope, u).degree;
   }
 
 private:
   FarMemManager* mgr_{nullptr};
+  const RemotingPolicy& policy_;
   VertexArray    verts_;
 
-  // Map the header for mutation
   inline VertexHdr& deref_vertex(const DerefScope& scope, uint64_t i) {
     void* p = verts_.slot(i)->deref_mut(scope);
     return *reinterpret_cast<VertexHdr*>(p);
   }
-
-  // Map the header read-only
   inline const VertexHdr& const_deref_vertex(const DerefScope& scope, uint64_t i) const {
-    auto* h = verts_.slot(i);            // non-const handle in const method
-    const void* p = h->deref(scope);     // returns const void*
+    auto* h = verts_.slot(i);
+    const void* p = h->deref(scope);
     return *reinterpret_cast<const VertexHdr*>(p);
   }
 };
 
 } // namespace far_memory
-//namegit add
