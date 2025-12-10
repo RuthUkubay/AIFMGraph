@@ -163,12 +163,12 @@ public:
     }
   }
   // Tell AIFM's GenericArray prefetcher that we will scan headers (u, u+1, ...)
+// inside class GraphAdj (public:)
 inline void enable_header_static_prefetch(uint32_t distance) {
-  // start at 0, step = 1 vertex each time, prefetch 'distance' future headers
-  verts_.static_prefetch(/*start=*/std::make_tuple(0ULL),
-                         /*step=*/ std::make_tuple(1ULL),
-                         /*num=*/  distance);
+  // Prefetch vertex headers starting at 0, stride 1, looking `distance` ahead.
+  verts_.static_prefetch(/*start=*/0, /*step=*/1, /*num=*/distance);
 }
+
 
 
 private:
