@@ -257,11 +257,46 @@ static Row run_case_tailwarm(FarMemManager* mgr,
   return r;
 }
 
+// ---- Tiny-tail peek sweep (K in {0,1,2,4,8}) with speedup vs baseline ----
+static void run_peek_table(FarMemManager* mgr,
+                           const std::vector<std::pair<Vid,Vid>>& edges,
+                           const char* policy_name,
+                           const RemotingPolicy& pol,
+                           const std::vector<uint32_t>& peeks) {
+  // Build one graph (shared across runs for apples-to-apples)
+  // Note: we rebuild inside run_case() for safety, but we also need stats only once for header.
+  // We'll just print stats from the baseline row.
+  Row baseline = run_case(mgr, edges, policy_name, pol, /*peek_k=*/0);
+  double base_us = baseline.bfs_us;
+
+  cout << policy_name << "," << "baseline" << ","
+       << baseline.inline_any << ","
+       << baseline.remote_any << ","
+       << baseline.remote_bytes << ","
+       << baseline.bfs_us << ","
+       << "—" << "\n";
+
+  // Now sweep peeks (skip 0 because we printed baseline already)
+  for (auto k : peeks) {
+    if (k == 0) continue;
+    Row r = run_case(mgr, edges, policy_name, pol, /*peek_k=*/k);
+    double speedup = (base_us - r.bfs_us) / base_us * 100.0; // + = faster
+    // reuse the baseline's layout stats to keep the table compact (they don't change with peek)
+    cout << policy_name << "," << ("tailpeek(" + std::to_string(k) + ")") << ","
+         << baseline.inline_any << ","
+         << baseline.remote_any << ","
+         << baseline.remote_bytes << ","
+         << r.bfs_us << ","
+         << (speedup >= 0 ? "+" : "") << speedup << "%\n";
+  }
+}
+
+
 static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
 
-  // Workload
+  // Workload: same as you’ve been using
   const uint64_t N = 200000;
   const uint64_t E = 1200000;
   const uint32_t W = 64;   // mild spatial locality
@@ -270,33 +305,19 @@ static void _main(void*) {
   AllRemote all_remote;
   Local8    local_8;
 
-    cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
-    cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
+  cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
+  cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,"
+          "BFS per-iter (µs),Speedup vs policy-baseline\n";
 
-  // All-remote: baseline vs gated tail warm (th=16)
-  {
-    Row base = run_case(manager.get(), edges, "All-remote", all_remote, /*header_pf=*/0);
-    cout << base.policy << "," << base.variant << "," << base.inline_any << ","
-         << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
+  // Peek sizes to sweep. Keep tiny to avoid the overhead you saw.
+  std::vector<uint32_t> peeks = {0, 1, 2, 4, 8};
 
-    Row warm = run_case_tailwarm(manager.get(), edges, "All-remote", all_remote, /*tail_threshold=*/16);
-    cout << warm.policy << "," << warm.variant << "," << warm.inline_any << ","
-         << warm.remote_any << "," << warm.remote_bytes << "," << warm.bfs_us << "\n";
-  }
-
-  // Local-8: baseline vs gated tail warm (th=16)
-  {
-    Row base = run_case(manager.get(), edges, "Local-8", local_8, /*header_pf=*/0);
-    cout << base.policy << "," << base.variant << "," << base.inline_any << ","
-         << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
-
-    Row warm = run_case_tailwarm(manager.get(), edges, "Local-8", local_8, /*tail_threshold=*/16);
-    cout << warm.policy << "," << warm.variant << "," << warm.inline_any << ","
-         << warm.remote_any << "," << warm.remote_bytes << "," << warm.bfs_us << "\n";
-  }
+  run_peek_table(manager.get(), edges, "All-remote", all_remote, peeks);
+  run_peek_table(manager.get(), edges, "Local-8",    local_8,    peeks);
 
   cout << "Done.\n";
 }
+
 
 int main(int argc, char* argv[]) {
   if (argc < 2) { std::cerr << "usage: " << argv[0] << " [cfg_file]\n"; return -EINVAL; }
