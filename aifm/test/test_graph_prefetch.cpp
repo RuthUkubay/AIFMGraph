@@ -202,6 +202,63 @@ static double bfs_sorted_frontier_time_us(GraphAdj &G, Vid src, uint32_t iters) 
          / static_cast<double>(iters);
 }
 
+// Adaptive frontier-sort: only sort a level when it's big AND tail-heavy
+static double bfs_frontier_sort_adaptive_time_us(GraphAdj &G, Vid src,
+                                                 uint32_t sort_min_frontier,   // e.g., 4096
+                                                 uint32_t tail_threshold,      // e.g., 64
+                                                 uint32_t iters) {
+  using clk = std::chrono::high_resolution_clock;
+  const uint64_t n = G.num_vertices();
+  if (src >= n) return 0.0;
+
+  auto run_once = [&](){
+    std::vector<int> dist(n, -1);
+    std::vector<Vid> curr, next;
+    curr.reserve(1024);
+    next.reserve(1024);
+
+    dist[src] = 0;
+    curr.push_back(src);
+
+    while (!curr.empty()) {
+      // Compute average tail length on this level
+      uint64_t tail_sum = 0;
+      {
+        DerefScope s;
+        for (Vid u : curr) {
+          auto h = G.header_info(u, s);
+          const uint32_t tail_len = (h.degree > h.inline_len) ? (h.degree - h.inline_len) : 0;
+          tail_sum += tail_len;
+        }
+      }
+      const double avg_tail = curr.empty() ? 0.0 : (double)tail_sum / (double)curr.size();
+
+      // Sort only if BOTH conditions are met
+      if (curr.size() >= sort_min_frontier && avg_tail >= (double)tail_threshold) {
+        std::sort(curr.begin(), curr.end());
+      }
+
+      // Expand this level
+      for (Vid u : curr) {
+        DerefScope s;
+        G.for_each_neighbor(u, s, [&](Vid v){
+          if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
+        });
+      }
+
+      curr.swap(next);
+      next.clear();
+    }
+  };
+
+  // warm
+  run_once();
+  auto t0 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) run_once();
+  auto t1 = clk::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+         / static_cast<double>(iters);
+}
 
 
 static Row run_case(FarMemManager* mgr,
@@ -329,49 +386,63 @@ static Row run_case_sorted_frontier(FarMemManager* mgr,
 
 
 
-static void _main(void*) {
-  std::unique_ptr<FarMemManager> manager(
-      FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
+{
+  const uint32_t kSortMinFrontier = 4096; // only sort when frontier is big
+  const uint32_t kTailThreshold   = 64;   // and tails are heavy on average
 
-  const uint64_t N = 200000;
-  const uint64_t E = 1200000;
-  const uint32_t W = 64;
-  auto edges = gen_banded_edges(N, E, W);
-
-  AllRemote all_remote;
-  Local8    local_8;
-
-  cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
-  cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs),Speedup vs policy-baseline\n";
-
-  // --- All-remote ---
-  Row baseA = run_case(manager.get(), edges, "All-remote", all_remote, /*peek_k=*/0);
-  cout << baseA.policy << "," << baseA.variant << "," << baseA.inline_any << ","
-       << baseA.remote_any << "," << baseA.remote_bytes << "," << baseA.bfs_us << ",—\n";
-
-  Row sortA = run_case_sorted_frontier(manager.get(), edges, "All-remote", all_remote);
+  // All-remote (adaptive)
   {
-    double speed = (baseA.bfs_us - sortA.bfs_us) / baseA.bfs_us * 100.0;
-    cout << sortA.policy << "," << sortA.variant << ","
-         << baseA.inline_any << "," << baseA.remote_any << "," << baseA.remote_bytes << ","
-         << sortA.bfs_us << "," << (speed >= 0 ? "+" : "") << speed << "%\n";
+    // rebuild the graph once for timing (same as run_case baseline pattern)
+    uint64_t Nmax = 0;
+    for (auto &e : edges) Nmax = std::max<uint64_t>(Nmax, std::max<uint64_t>(e.first, e.second));
+    GraphAdj G(manager.get(), Nmax + 1, all_remote);
+    G.build_from_edges(edges);
+
+    double us = bfs_frontier_sort_adaptive_time_us(G, /*src=*/0,
+                                                   kSortMinFrontier, kTailThreshold,
+                                                   /*iters=*/5);
+    // stats just for context
+    uint64_t inline_any=0, remote_any=0, remote_bytes=0;
+    for (uint64_t u = 0; u < G.num_vertices(); ++u) {
+      DerefScope s;
+      auto h = G.header_info(u, s);
+      if (h.inline_len > 0) inline_any++;
+      if (h.degree > h.inline_len) {
+        remote_any++;
+        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
+      }
+    }
+    cout << "All-remote,frontier-sort(adaptive f>=4096 tail>=64),"
+         << inline_any << "," << remote_any << "," << remote_bytes << ","
+         << us << "\n";
   }
 
-  // --- Local-8 ---
-  Row baseL = run_case(manager.get(), edges, "Local-8", local_8, /*peek_k=*/0);
-  cout << baseL.policy << "," << baseL.variant << "," << baseL.inline_any << ","
-       << baseL.remote_any << "," << baseL.remote_bytes << "," << baseL.bfs_us << ",—\n";
-
-  Row sortL = run_case_sorted_frontier(manager.get(), edges, "Local-8", local_8);
+  // Local-8 (adaptive)
   {
-    double speed = (baseL.bfs_us - sortL.bfs_us) / baseL.bfs_us * 100.0;
-    cout << sortL.policy << "," << sortL.variant << ","
-         << baseL.inline_any << "," << baseL.remote_any << "," << baseL.remote_bytes << ","
-         << sortL.bfs_us << "," << (speed >= 0 ? "+" : "") << speed << "%\n";
-  }
+    uint64_t Nmax = 0;
+    for (auto &e : edges) Nmax = std::max<uint64_t>(Nmax, std::max<uint64_t>(e.first, e.second));
+    GraphAdj G(manager.get(), Nmax + 1, local_8);
+    G.build_from_edges(edges);
 
-  cout << "Done.\n";
+    double us = bfs_frontier_sort_adaptive_time_us(G, /*src=*/0,
+                                                   kSortMinFrontier, kTailThreshold,
+                                                   /*iters=*/5);
+    uint64_t inline_any=0, remote_any=0, remote_bytes=0;
+    for (uint64_t u = 0; u < G.num_vertices(); ++u) {
+      DerefScope s;
+      auto h = G.header_info(u, s);
+      if (h.inline_len > 0) inline_any++;
+      if (h.degree > h.inline_len) {
+        remote_any++;
+        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
+      }
+    }
+    cout << "Local-8,frontier-sort(adaptive f>=4096 tail>=64),"
+         << inline_any << "," << remote_any << "," << remote_bytes << ","
+         << us << "\n";
+  }
 }
+
 
 
 
