@@ -1,3 +1,4 @@
+// inc/graph_adj.hpp
 #pragma once
 
 extern "C" {
@@ -14,6 +15,7 @@ extern "C" {
 #include <utility>
 #include <cassert>
 #include <algorithm>
+#include <cstring>   // <-- for std::memset
 
 namespace far_memory {
 
@@ -45,8 +47,8 @@ struct VertexHdr {
 class VertexArray : public GenericArray {
 public:
   inline VertexArray(FarMemManager* mgr, uint64_t n_vertices)
-    : GenericArray(mgr, /*item_size=*/sizeof(VertexHdr),
-                        /*num_items=*/n_vertices) {}
+      : GenericArray(mgr, /*item_size=*/sizeof(VertexHdr),
+                          /*num_items=*/n_vertices) {}
 
   inline GenericUniquePtr* slot(uint64_t i) { return at(false, i); }
   inline GenericUniquePtr* slot(uint64_t i) const {
@@ -76,20 +78,29 @@ public:
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
         auto &vh = deref_vertex(scope, u);
-        vh.degree = deg[u];
-        vh.inline_len = 0;
-        vh.tail = GenericUniquePtr{};
 
-        if (vh.degree == 0) continue;
+        // **Fix #1: zero the whole header to avoid stale bits**
+        std::memset(&vh, 0, sizeof(VertexHdr));
+
+        vh.degree = deg[u];
+
+        if (vh.degree == 0) {
+          vh.inline_len = 0;
+          vh.tail = GenericUniquePtr{};
+          continue;
+        }
 
         const uint16_t wish =
-          policy_.inline_capacity(static_cast<Vid>(u), vh.degree);
+            policy_.inline_capacity(static_cast<Vid>(u), vh.degree);
         vh.inline_len = std::min<uint16_t>(wish, VertexHdr::kInlineCap);
 
         const uint32_t tail_deg = vh.degree - vh.inline_len;
         if (tail_deg > 0) {
-          const uint16_t bytes = static_cast<uint16_t>(tail_deg * sizeof(Vid));
+          const uint16_t bytes =
+              static_cast<uint16_t>(tail_deg * sizeof(Vid));
           vh.tail = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, bytes);
+        } else {
+          vh.tail = GenericUniquePtr{}; // explicit empty
         }
       }
     }
@@ -101,17 +112,23 @@ public:
       for (auto [u, v] : edges) {
         auto &vh = deref_vertex(scope, u);
         if (vh.degree == 0) continue;
+
         if (cur[u] < vh.inline_len) {
           vh.inline_small[cur[u]++] = v;
         } else {
-          auto *base = static_cast<uint8_t*>(vh.tail.deref_mut(scope));
-          reinterpret_cast<Vid*>(base)[cur[u] - vh.inline_len] = v;
+          // **Defensive guard**: only write tail if it exists
+          const uint32_t tail_idx = cur[u] - vh.inline_len;
+          const uint32_t tail_deg = vh.degree - vh.inline_len;
+          if (tail_deg > 0) {
+            auto *base = static_cast<uint8_t*>(vh.tail.deref_mut(scope));
+            reinterpret_cast<Vid*>(base)[tail_idx] = v;
+          }
           ++cur[u];
         }
       }
     }
   }
-  
+
   struct NeighborView {
     const Vid* inline_ptr{nullptr};
     uint32_t   inline_len{0};
@@ -124,13 +141,15 @@ public:
     NeighborView nv;
     nv.inline_ptr = vh.inline_small;
     nv.inline_len = vh.inline_len;
-    if (vh.degree > vh.inline_len) {
-      // auto *h = verts_.slot(u); // need handle to deref tail
-      // const auto *base = static_cast<const uint8_t*>(h->deref(scope));
-      // base points to header; the tail pointer is in vh.tail
-      const auto *tail_base = static_cast<const uint8_t*>(vh.tail.deref(scope));
+    nv.tail_ptr   = nullptr;    // **Fix #2: always initialize**
+    nv.tail_len   = 0;
+
+    const uint32_t tail_deg =
+        (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
+    if (tail_deg > 0) {
+      const void *tail_base = vh.tail.deref(scope);  // safe only when tail exists
       nv.tail_ptr = reinterpret_cast<const Vid*>(tail_base);
-      nv.tail_len = vh.degree - vh.inline_len;
+      nv.tail_len = tail_deg;
     }
     return nv;
   }
@@ -144,7 +163,8 @@ public:
   inline uint32_t degree(uint64_t u, DerefScope& scope) const {
     return const_deref_vertex(scope, u).degree;
   }
-    /* ---- Prefetch helpers (PUBLIC) ---- */
+
+  /* ---- Prefetch helpers (PUBLIC) ---- */
 
   // Sequential header prefetch: tell AIFM we’ll likely touch vertices
   // [start, start+num) soon (stride=1).
@@ -162,14 +182,12 @@ public:
       (void)vh.tail.deref(s); // bring tail into cache
     }
   }
-  // Tell AIFM's GenericArray prefetcher that we will scan headers (u, u+1, ...)
-// inside class GraphAdj (public:)
-inline void enable_header_static_prefetch(uint32_t distance) {
-  // Prefetch vertex headers starting at 0, stride 1, looking `distance` ahead.
-  verts_.static_prefetch(/*start=*/0, /*step=*/1, /*num=*/distance);
-}
 
-
+  // Convenience: enable a rolling static prefetch window over headers.
+  inline void enable_header_static_prefetch(uint32_t distance) {
+    if (distance == 0) return;
+    verts_.static_prefetch(/*start=*/0, /*step=*/1, /*num=*/distance);
+  }
 
 private:
   FarMemManager* mgr_{nullptr};
