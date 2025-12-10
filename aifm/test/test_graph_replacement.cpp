@@ -6,15 +6,16 @@ extern "C" {
 #include "device.hpp"    // FakeDevice
 #include "manager.hpp"
 #include "deref_scope.hpp"
-#include "graph_adj.hpp" // your pointer-chasing graph header
-
+#include "graph_adj.hpp" // pointer-chasing graph header (in inc/)
+#include <algorithm>
+#include <chrono>
+#include <iostream>
 #include <memory>
+#include <queue>    // <-- needed for std::queue
 #include <random>
 #include <vector>
-#include <iostream>
-#include <chrono>
 
-// --------- FarMem knobs (similar to your working tests) ----------
+// --------- FarMem knobs (same style as your working tests) ----------
 using namespace far_memory;
 using std::cout;
 using std::endl;
@@ -29,33 +30,6 @@ struct GenParams {
   uint64_t num_edges;
   uint64_t seed;
 };
-// --- Minimal BFS over GraphAdj that reads both inline and tail spans ---
-static std::vector<int> bfs(GraphAdj &G, Vid src) {
-  const uint64_t n = G.num_vertices();
-  std::vector<int> dist(n, -1);
-  if (src >= n) return dist;
-
-  std::queue<Vid> q;
-  dist[src] = 0;
-  q.push(src);
-
-  while (!q.empty()) {
-    Vid u = q.front(); q.pop();
-    DerefScope scope;
-    auto view = G.neighbors(u, scope); // returns inline + tail spans
-
-    for (uint32_t i = 0; i < view.inline_len; ++i) {
-      Vid v = view.inline_ptr[i];
-      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    }
-    for (uint32_t i = 0; i < view.tail_len; ++i) {
-      Vid v = view.tail_ptr[i];
-      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    }
-  }
-  return dist;
-}
-
 
 static std::vector<std::pair<Vid,Vid>>
 gen_random_edges(const GenParams& p) {
@@ -72,7 +46,7 @@ gen_random_edges(const GenParams& p) {
   return edges;
 }
 
-// --------- Three placement policies ----------
+// --------- Placement policies ----------
 struct AllRemotePolicy : RemotingPolicy {
   uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
 };
@@ -121,6 +95,32 @@ static void print_stats(const char* name, const PlacementStats& st, uint64_t N) 
        << "\n";
 }
 
+// --------- Minimal BFS over GraphAdj (reads inline and tail spans) ----------
+static std::vector<int> bfs(GraphAdj &G, Vid src) {
+  const uint64_t n = G.num_vertices();
+  std::vector<int> dist(n, -1);
+  if (src >= n) return dist;
+
+  std::queue<Vid> q;
+  dist[src] = 0; q.push(src);
+
+  while (!q.empty()) {
+    Vid u = q.front(); q.pop();
+    DerefScope scope;
+    auto view = G.neighbors(u, scope);
+
+    for (uint32_t i = 0; i < view.inline_len; ++i) {
+      Vid v = view.inline_ptr[i];
+      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+    }
+    for (uint32_t i = 0; i < view.tail_len; ++i) {
+      Vid v = view.tail_ptr[i];
+      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+    }
+  }
+  return dist;
+}
+
 // --------- BFS timing ----------
 static void run_bfs_and_time(GraphAdj& G, Vid src, int iters, const char* tag) {
   using clk = std::chrono::high_resolution_clock;
@@ -141,7 +141,6 @@ static void run_bfs_and_time(GraphAdj& G, Vid src, int iters, const char* tag) {
 
 // --------- Work driver: build once per policy and compare ----------
 static void do_work(FarMemManager* manager) {
-  // One shared graph spec; size big enough to exceed cache via tails.
   GenParams gen { .num_vertices = 200000, .num_edges = 1200000, .seed = 42 };
   auto edges = gen_random_edges(gen);
   cout << "Graph: |V|=" << gen.num_vertices << " |E|=" << edges.size() << "\n";
@@ -168,7 +167,7 @@ static void do_work(FarMemManager* manager) {
     run_bfs_and_time(G, /*src=*/0, /*iters=*/5, "inline_8");
   }
 
-  // 3) Inline up to 16 (will cap at 8 in current header; useful for A/B if you raise cap later)
+  // 3) Inline up to 16 (will cap at 8 in current header; useful A/B if you raise cap later)
   {
     Inline16Policy pol;
     GraphAdj G(manager, gen.num_vertices, pol);

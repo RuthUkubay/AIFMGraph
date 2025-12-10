@@ -125,8 +125,8 @@ public:
     nv.inline_ptr = vh.inline_small;
     nv.inline_len = vh.inline_len;
     if (vh.degree > vh.inline_len) {
-      auto *h = verts_.slot(u); // need handle to deref tail
-      const auto *base = static_cast<const uint8_t*>(h->deref(scope));
+      // auto *h = verts_.slot(u); // need handle to deref tail
+      // const auto *base = static_cast<const uint8_t*>(h->deref(scope));
       // base points to header; the tail pointer is in vh.tail
       const auto *tail_base = static_cast<const uint8_t*>(vh.tail.deref(scope));
       nv.tail_ptr = reinterpret_cast<const Vid*>(tail_base);
