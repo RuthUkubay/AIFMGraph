@@ -13,7 +13,6 @@ extern "C" {
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -32,6 +31,7 @@ struct VertexHdr {
   uint32_t degree{0};
   uint16_t inline_len{0};
 
+  // Small inline buffer to avoid a remote touch for tiny adjacency lists.
   static constexpr uint16_t kInlineCap = 8;
   Vid inline_small[kInlineCap]{};     // tiny adjacency in the header
   mutable GenericUniquePtr tail;      // remaining neighbors, if any
@@ -72,18 +72,31 @@ public:
       for (uint64_t u = 0; u < N; ++u) {
         auto &vh = deref_vertex(scope, u);
 
-        // full zero-init (safe for POD; VertexHdr is POD here)
+        // Zero-init the POD header.
         vh = VertexHdr{};
 
         vh.degree = deg[u];
-        if (vh.degree == 0) continue;
+        if (vh.degree == 0) {
+          vh.inline_len = 0;
+          vh.tail = GenericUniquePtr{};
+          continue;
+        }
 
         const uint16_t wish = policy_.inline_capacity((Vid)u, vh.degree);
         vh.inline_len = std::min<uint16_t>(wish, VertexHdr::kInlineCap);
 
         const uint32_t tail_deg = vh.degree - vh.inline_len;
         if (tail_deg > 0) {
-          const uint16_t bytes = static_cast<uint16_t>(tail_deg * sizeof(Vid));
+          // SAFETY: vanilla DS uses uint16_t length; guard against > 64KB.
+          const uint32_t bytes32 = tail_deg * sizeof(Vid);
+          if (bytes32 > 65535) {
+            fprintf(stderr,
+                    "GraphAdj: vertex %lu tail bytes=%u exceed 64KB DS limit; "
+                    "reduce degree or use a chunked DS.\n",
+                    (unsigned long)u, bytes32);
+            abort();
+          }
+          const uint16_t bytes = static_cast<uint16_t>(bytes32);
           vh.tail = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, bytes);
         } else {
           vh.tail = GenericUniquePtr{};
@@ -130,7 +143,8 @@ public:
     const uint32_t tail_deg =
         (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
     if (tail_deg > 0) {
-      const void *tail_base = vh.tail.deref(scope);   // only if tail exists
+      // Deref tail only when it exists.
+      const void *tail_base = vh.tail.deref(scope);
       nv.tail_ptr = reinterpret_cast<const Vid*>(tail_base);
       nv.tail_len = tail_deg;
     }
