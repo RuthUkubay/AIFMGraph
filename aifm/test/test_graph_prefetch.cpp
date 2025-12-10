@@ -1,4 +1,4 @@
-// test/test_graph_prefetch.cpp
+// aifm/test/test_graph_prefetch.cpp
 extern "C" {
 #include <runtime/runtime.h>
 }
@@ -25,7 +25,7 @@ constexpr uint64_t kCacheSize    = (128ULL << 20);
 constexpr uint64_t kFarMemSize   = (4ULL  << 30);
 constexpr uint32_t kNumGCThreads = 12;
 
-/*** Placement policies ***/
+/* Policies */
 struct AllRemote : RemotingPolicy {
   uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
 };
@@ -35,12 +35,12 @@ struct Local8 : RemotingPolicy {
   }
 };
 
-/*** Banded generator ***/
+/* Banded generator: neighbors of u fall in [u, u+W) */
 static std::vector<std::pair<Vid,Vid>>
-gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
+gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed=42) {
   std::mt19937_64 rng(seed);
   std::uniform_int_distribution<uint64_t> Uu(0, N - 1);
-  std::uniform_int_distribution<uint32_t> Uw(0, window - 1);
+  std::uniform_int_distribution<uint32_t> Uw(0, W - 1);
 
   std::vector<std::pair<Vid,Vid>> edges;
   edges.reserve(E);
@@ -53,96 +53,69 @@ gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
   return edges;
 }
 
-/*** BFS variants (iterator API) ***/
-static std::vector<int> bfs_baseline(GraphAdj &G, Vid src) {
+/* One BFS: uses for_each_neighbor (safe for all layouts) */
+static double bfs_time_us(GraphAdj &G, Vid src, uint32_t iters) {
+  using clk = std::chrono::high_resolution_clock;
   const uint64_t n = G.num_vertices();
-  std::vector<int> dist(n, -1);
-  if (src >= n) return dist;
-  std::queue<Vid> q; dist[src] = 0; q.push(src);
+  if (src >= n) return 0.0;
 
-  while (!q.empty()) {
-    Vid u = q.front(); q.pop();
-    DerefScope s;
-    G.for_each_neighbor(u, s, [&](Vid v){
-      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    });
-  }
-  return dist;
-}
+  auto run_once = [&](){
+    std::vector<int> dist(n, -1);
+    std::queue<Vid> q;
+    dist[src] = 0; q.push(src);
 
-static std::vector<int> bfs_header_prefetch(GraphAdj &G, Vid src, uint32_t pf_dist) {
-  G.enable_header_static_prefetch(pf_dist);
-
-  const uint64_t n = G.num_vertices();
-  std::vector<int> dist(n, -1);
-  if (src >= n) return dist;
-
-  std::vector<Vid> curr, next;
-  curr.reserve(4096); next.reserve(4096);
-  dist[src] = 0; curr.push_back(src);
-
-  while (!curr.empty()) {
-    std::sort(curr.begin(), curr.end()); // stride-1 header accesses
-    for (Vid u : curr) {
+    while (!q.empty()) {
+      Vid u = q.front(); q.pop();
       DerefScope s;
       G.for_each_neighbor(u, s, [&](Vid v){
-        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
       });
     }
-    curr.swap(next); next.clear();
-  }
-  return dist;
-}
+  };
 
-struct RunCfg { const char* name; const RemotingPolicy& pol; uint32_t pf_distance; };
-
-static double time_bfs(GraphAdj& G, Vid src, uint32_t iters, uint32_t pf_distance) {
-  using clk = std::chrono::high_resolution_clock;
-  (void)(pf_distance == 0 ? bfs_baseline(G, src)
-                          : bfs_header_prefetch(G, src, pf_distance));
+  // warm
+  run_once();
   auto t0 = clk::now();
-  for (uint32_t i = 0; i < iters; ++i) {
-    if (pf_distance == 0) (void)bfs_baseline(G, src);
-    else                  (void)bfs_header_prefetch(G, src, pf_distance);
-  }
+  for (uint32_t i = 0; i < iters; ++i) run_once();
   auto t1 = clk::now();
   return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
          / static_cast<double>(iters);
 }
 
-static void do_work(FarMemManager* mgr) {
-  const uint64_t N = 200000;
-  const uint64_t E = 3200000; // large; used to crash without chunking
-  const uint32_t W = 16;
-  const uint32_t iters = 5;
+/* run one configuration safely */
+struct Row {
+  const char* policy;
+  const char* prefetch;
+  uint64_t inline_any;
+  uint64_t remote_any;
+  uint64_t remote_bytes;
+  double   bfs_us;
+};
 
-  auto edges = gen_banded_edges(N, E, W);
+static Row run_case(FarMemManager* mgr,
+                    const std::vector<std::pair<Vid,Vid>>& edges,
+                    const char* policy_name,
+                    const RemotingPolicy& pol,
+                    uint32_t header_pf /*0 = off*/) {
+  Row r{};
+  r.policy   = policy_name;
+  r.prefetch = header_pf ? "header(d=64)" : "none";
 
-  AllRemote all_remote;
-  Local8    local_8;
+  {
+    GraphAdj G(mgr, /*N=*/0, pol); // will reset below (avoid early alloc)
+  }
 
-  std::vector<RunCfg> runs = {
-    {"All-remote / no-prefetch",       all_remote, 0},
-    {"All-remote / header-pf(d=64)",   all_remote, 64},
-    {"Local-8 / no-prefetch",          local_8,    0},
-    {"Local-8 / header-pf(d=64)",      local_8,    64},
-  };
+  // Build graph inside a tight scope so the object is destroyed after use
+  {
+    GraphAdj G(mgr, /*N=*/edges.empty()?0:(
+      [&](){ Vid maxv=0; for(auto &e:edges){ if (e.first>maxv) maxv=e.first; if (e.second>maxv) maxv=e.second; } return (uint64_t)maxv+1; }()
+    ), pol);
 
-  cout << "Graph: |V|=" << N << " |E|=" << E
-       << " (banded window=" << W << ")\n";
-
-  cout << "Policy,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,"
-          "BFS per-iter (µs),Speedup vs All-remote(no-pf)\n";
-
-  double baseline_us = 0.0;
-
-  for (size_t i = 0; i < runs.size(); ++i) {
-    const auto& cfg = runs[i];
-    GraphAdj G(mgr, N, cfg.pol);
     G.build_from_edges(edges);
 
-    // layout stats (no internal peeking; algebraic)
-    uint64_t inline_any = 0, remote_any = 0, remote_bytes = 0;
+    // stats
+    const uint64_t N = G.num_vertices();
+    uint64_t inline_any=0, remote_any=0, remote_bytes=0;
     for (uint64_t u = 0; u < N; ++u) {
       DerefScope s;
       auto h = G.header_info(u, s);
@@ -152,29 +125,55 @@ static void do_work(FarMemManager* mgr) {
         remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
       }
     }
+    r.inline_any   = inline_any;
+    r.remote_any   = remote_any;
+    r.remote_bytes = remote_bytes;
 
-    const double us = time_bfs(G, /*src=*/0, iters, cfg.pf_distance);
-    if (i == 0) baseline_us = us;
-    const double speed = (i == 0) ? 0.0 : (baseline_us - us) / baseline_us * 100.0;
-
-    cout << cfg.name << ","
-         << inline_any << ","
-         << remote_any << ","
-         << remote_bytes << ","
-         << us << ",";
-    if (i == 0) cout << "—";
-    else        cout << (speed >= 0 ? "+" : "") << speed << "%";
-    cout << "\n";
-
-    G.disable_header_prefetch();
+    if (header_pf) G.enable_header_static_prefetch(header_pf);
+    r.bfs_us = bfs_time_us(G, /*src=*/0, /*iters=*/5);
+    if (header_pf) G.disable_header_prefetch();
+    // G destroyed here before next case
   }
-  cout << "Done.\n";
+  return r;
 }
 
 static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
-  do_work(manager.get());
+
+  const uint64_t N = 200000;
+  const uint64_t E = 3200000;
+  const uint32_t W = 16;
+
+  auto edges = gen_banded_edges(N, E, W);
+
+  AllRemote all_remote;
+  Local8    local_8;
+
+  cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
+  cout << "Policy,Prefetch,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
+
+  // 1) two clear comparisons: all-remote w/wo header prefetch
+  {
+    Row a = run_case(manager.get(), edges, "All-remote", all_remote, 0);
+    cout << a.policy << "," << a.prefetch << "," << a.inline_any << "," << a.remote_any
+         << "," << a.remote_bytes << "," << a.bfs_us << "\n";
+    Row b = run_case(manager.get(), edges, "All-remote", all_remote, 64);
+    cout << b.policy << "," << b.prefetch << "," << b.inline_any << "," << b.remote_any
+         << "," << b.remote_bytes << "," << b.bfs_us << "\n";
+  }
+
+  // 2) local-8 w/wo header prefetch
+  {
+    Row a = run_case(manager.get(), edges, "Local-8", local_8, 0);
+    cout << a.policy << "," << a.prefetch << "," << a.inline_any << "," << a.remote_any
+         << "," << a.remote_bytes << "," << a.bfs_us << "\n";
+    Row b = run_case(manager.get(), edges, "Local-8", local_8, 64);
+    cout << b.policy << "," << b.prefetch << "," << b.inline_any << "," << b.remote_any
+         << "," << b.remote_bytes << "," << b.bfs_us << "\n";
+  }
+
+  cout << "Done.\n";
 }
 
 int main(int argc, char* argv[]) {
