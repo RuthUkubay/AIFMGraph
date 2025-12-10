@@ -1,3 +1,4 @@
+// aifm/test/test_generate_graph.cpp
 extern "C" {
 #include <runtime/runtime.h>
 }
@@ -5,25 +6,26 @@ extern "C" {
 #include "graph_adj.hpp"
 #include "device.hpp"   // FakeDevice
 #include "manager.hpp"
+#include "deref_scope.hpp"
 
-#include <memory>
-#include <random>
-#include <iostream>
-#include <vector>
-#include <utility>
-#include <cstdint>
 #include <cassert>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <queue>
+#include <random>
+#include <utility>
+#include <vector>
 
 using namespace far_memory;
 using std::cout;
 using std::endl;
 
-// Keep the “FakeDevice-level” simplicity and sizes similar to your array test.
-constexpr uint64_t kCacheSize    = (128ULL << 20); // 128 MB local cache
-constexpr uint64_t kFarMemSize   = (4ULL  << 30);  // 4 GB far memory
+constexpr uint64_t kCacheSize    = (128ULL << 20); // 128 MB
+constexpr uint64_t kFarMemSize   = (4ULL  << 30);  // 4 GB
 constexpr uint32_t kNumGCThreads = 12;
 
-// Params for a simple random directed graph (Erdős–Rényi style).
 struct GenParams {
   uint64_t num_vertices;
   uint64_t num_edges;
@@ -39,8 +41,7 @@ static std::vector<std::pair<Vid,Vid>> gen_random_edges(const GenParams& p) {
   for (uint64_t i = 0; i < p.num_edges; ++i) {
     Vid u = static_cast<Vid>(U(rng));
     Vid v = static_cast<Vid>(U(rng));
-    // Optional: avoid self loops; comment out if you want them.
-    if (u == v) { if (u + 1 < p.num_vertices) v = u + 1; else v = 0; }
+    if (u == v) v = (u + 1 < p.num_vertices) ? u + 1 : 0; // avoid self-loop
     edges.emplace_back(u, v);
   }
   return edges;
@@ -49,7 +50,7 @@ static std::vector<std::pair<Vid,Vid>> gen_random_edges(const GenParams& p) {
 static void sanity_check(GraphAdj& G, const std::vector<std::pair<Vid,Vid>>& edges) {
   const uint64_t N = G.num_vertices();
 
-  // Check total degree sum equals |E|
+  // total degree check
   uint64_t sum_deg = 0;
   for (uint64_t u = 0; u < N; ++u) {
     DerefScope s;
@@ -60,48 +61,85 @@ static void sanity_check(GraphAdj& G, const std::vector<std::pair<Vid,Vid>>& edg
          << " edges=" << edges.size() << endl;
   }
 
-  // Spot-check a few vertices’ neighbor materialization.
+  // touch a few neighbor entries (inline and tail) for first few vertices
   for (uint64_t u = 0; u < std::min<uint64_t>(N, 5); ++u) {
     DerefScope s;
     auto view = G.neighbors(u, s);
-    // Just touch the first few entries if they exist.
-    for (uint32_t i = 0; i < std::min<uint32_t>(view.len, 3); ++i) {
-      volatile Vid v = view.ptr[i]; (void)v; // prevent optimizing away
+
+    for (uint32_t i = 0; i < std::min<uint32_t>(view.inline_len, 3u); ++i) {
+      volatile Vid v = view.inline_ptr[i]; (void)v;
+    }
+    for (uint32_t i = 0; i < std::min<uint32_t>(view.tail_len, 3u); ++i) {
+      volatile Vid v = view.tail_ptr[i]; (void)v;
     }
   }
 }
 
-static void do_work(FarMemManager* manager,
-                    const GenParams& gen) {
+// Minimal BFS that understands inline + tail layout
+static std::vector<int> bfs(GraphAdj& G, Vid src) {
+  const uint64_t n = G.num_vertices();
+  std::vector<int> dist(n, -1);
+  if (src >= n) return dist;
+
+  std::queue<Vid> q;
+  dist[src] = 0; q.push(src);
+
+  while (!q.empty()) {
+    Vid u = q.front(); q.pop();
+    DerefScope scope;
+    auto view = G.neighbors(u, scope);
+
+    for (uint32_t i = 0; i < view.inline_len; ++i) {
+      Vid v = view.inline_ptr[i];
+      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+    }
+    for (uint32_t i = 0; i < view.tail_len; ++i) {
+      Vid v = view.tail_ptr[i];
+      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+    }
+  }
+  return dist;
+}
+
+// Simple “all-remote” policy for this test
+struct AllRemotePolicy : RemotingPolicy {
+  uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
+};
+
+static void do_work(FarMemManager* manager, const GenParams& gen) {
   cout << "Running " << __FILE__ << "..." << endl;
 
-  // Generate edges on host.
   auto edges = gen_random_edges(gen);
 
-  // Build graph into far memory.
-  GraphAdj G(manager, gen.num_vertices);
+  // NOTE: GraphAdj now needs a policy
+  AllRemotePolicy pol;
+  GraphAdj G(manager, gen.num_vertices, pol);
   G.build_from_edges(edges);
 
-  // Sanity checks (degree sum; light neighbor touches).
   sanity_check(G, edges);
+
+  // quick BFS timing (optional)
+  using clk = std::chrono::high_resolution_clock;
+  auto warm = bfs(G, 0); (void)warm;
+
+  auto t0 = clk::now();
+  auto dist = bfs(G, 0);
+  auto t1 = clk::now();
+  auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  cout << "BFS one run: " << us << " us" << endl;
 
   cout << "Graph built: |V|=" << gen.num_vertices
        << " |E|=" << edges.size() << endl;
-
   cout << "Passed" << endl;
 }
 
-static void _main(void* arg) {
-  // Build a FakeDevice-backed manager (like your array test).
+static void _main(void* /*arg*/) {
   std::unique_ptr<FarMemManager> manager(
-      FarMemManagerFactory::build(kCacheSize, kNumGCThreads,
-                                  new FakeDevice(kFarMemSize)));
+      FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
 
-  // Default: a moderate graph that exceeds cache with adjacency data.
-  // Tweak as needed (you can wire args later).
   GenParams gen {
-    .num_vertices = 2000,   // 2M vertices
-    .num_edges    = 100000,  // 10M edges
+    .num_vertices = 2000,
+    .num_edges    = 100000,
     .seed         = 42
   };
 
