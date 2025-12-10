@@ -201,6 +201,37 @@ static double bfs_sorted_frontier_time_us(GraphAdj &G, Vid src, uint32_t iters) 
   return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
          / static_cast<double>(iters);
 }
+static inline void bin_frontier(std::vector<Vid>& curr,
+                                std::vector<Vid>& tmp,
+                                uint32_t block_bits /* e.g., 10 for 1024 */) {
+  const uint32_t B = 1u << block_bits;
+  if (curr.empty()) return;
+
+  // Find bin range
+  Vid minv = curr[0], maxv = curr[0];
+  for (Vid v : curr) { if (v < minv) minv = v; if (v > maxv) maxv = v; }
+  uint32_t first_bin = minv >> block_bits;
+  uint32_t last_bin  = maxv >> block_bits;
+  uint32_t nbins = last_bin - first_bin + 1;
+
+  // Count
+  std::vector<uint32_t> cnt(nbins, 0);
+  for (Vid v : curr) cnt[(v >> block_bits) - first_bin]++;
+
+  // Prefix
+  std::vector<uint32_t> off(nbins, 0);
+  for (uint32_t i = 1; i < nbins; ++i) off[i] = off[i-1] + cnt[i-1];
+
+  // Scatter into tmp by bin order
+  tmp.resize(curr.size());
+  std::vector<uint32_t> cur = off; // copy
+  for (Vid v : curr) {
+    uint32_t b = (v >> block_bits) - first_bin;
+    tmp[cur[b]++] = v;
+  }
+  curr.swap(tmp);
+}
+
 
 // Adaptive frontier-sort: only sort a level when it's big AND tail-heavy
 static double bfs_frontier_sort_adaptive_time_us(GraphAdj &G, Vid src,
@@ -234,9 +265,10 @@ static double bfs_frontier_sort_adaptive_time_us(GraphAdj &G, Vid src,
       const double avg_tail = curr.empty() ? 0.0 : (double)tail_sum / (double)curr.size();
 
       // Sort only if BOTH conditions are met
-      if (curr.size() >= sort_min_frontier && avg_tail >= (double)tail_threshold) {
-        std::sort(curr.begin(), curr.end());
-      }
+      if (curr.size() >= sort_min_frontier && avg_tail >= tail_threshold) {
+        static thread_local std::vector<Vid> tmp_bin;
+        bin_frontier(curr, tmp_bin, /*block_bits=*/10); // 1024-ID bins
+        }
 
       // Expand this level
       for (Vid u : curr) {
@@ -378,8 +410,8 @@ static void _main(void*) {
   }
 
   // ---- Adaptive frontier sort (only when frontier large & tails heavy) ----
-  const uint32_t kSortMinFrontier = 4096; // only sort when frontier is big
-  const uint32_t kTailThreshold   = 64;   // and average tail >= 64
+    const uint32_t kSortMinFrontier = 20000; // was 4096
+    const uint32_t kTailThreshold   = 128;   // was 64
 
   // All-remote (adaptive)
   {
