@@ -111,7 +111,7 @@ public:
       }
     }
   }
-
+  
   struct NeighborView {
     const Vid* inline_ptr{nullptr};
     uint32_t   inline_len{0};
@@ -144,6 +144,25 @@ public:
   inline uint32_t degree(uint64_t u, DerefScope& scope) const {
     return const_deref_vertex(scope, u).degree;
   }
+    /* ---- Prefetch helpers (PUBLIC) ---- */
+
+  // Sequential header prefetch: tell AIFM we’ll likely touch vertices
+  // [start, start+num) soon (stride=1).
+  inline void prefetch_headers_span(uint64_t start, uint32_t num) {
+    if (num == 0) return;
+    verts_.static_prefetch(/*start=*/start, /*step=*/1, /*num=*/num);
+  }
+
+  // Hint: fetch the remote tail now (first touch) if it exists.
+  // NOTE: this does a real deref; use sparingly as a "warm" hint.
+  inline void hint_tail_present(uint64_t u) {
+    DerefScope s;
+    const auto &vh = const_deref_vertex(s, u);
+    if (vh.degree > vh.inline_len) {
+      (void)vh.tail.deref(s); // bring tail into cache
+    }
+  }
+
 
 private:
   FarMemManager* mgr_{nullptr};
