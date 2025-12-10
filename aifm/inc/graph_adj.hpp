@@ -75,7 +75,8 @@ public:
         auto &vh = deref_vertex(scope, u);
 
         // Full zero-init to avoid stale bits
-        std::memset(&vh, 0, sizeof(VertexHdr));
+        // std::memset(&vh, 0, sizeof(VertexHdr));
+        vh = VertexHdr{}; 
 
         vh.degree = deg[u];
         if (vh.degree == 0) continue;
