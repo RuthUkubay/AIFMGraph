@@ -164,12 +164,13 @@ inline void warm_tail_prefix(uint64_t u, uint32_t k, DerefScope& scope) const {
 }
 
 inline void hint_tail_present(uint64_t u) const {
-    DerefScope s;
-    const auto &vh = const_deref_vertex(s, u);
-    if (vh.degree > vh.inline_len) {
-      (void)vh.tail.deref(s);
-    }
+  DerefScope s;
+  const auto &vh = const_deref_vertex(s, u);
+  if (vh.degree > vh.inline_len) {
+    (void)vh.tail.deref(s);   // map the tail once, then drop the scope
   }
+}
+
 
 
 
