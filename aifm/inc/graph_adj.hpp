@@ -116,15 +116,7 @@ public:
   if (num == 0) return;
   verts_.static_prefetch(/*start=*/start, /*step=*/1, /*num=*/num);
 }
-// Tiny synthetic work per edge to create overlap opportunity.
-// Keep 'sink' volatile so the compiler can't optimize it away.
-  static inline void do_edge_work(volatile uint32_t &sink, Vid v, uint32_t edge_work) {
-    uint32_t x = static_cast<uint32_t>(v) ^ 0x9e3779b9u;
-    for (uint32_t i = 0; i < edge_work; ++i) {
-      x = x * 1664525u + 1013904223u + i;  // cheap integer mix
-    }
-    sink ^= x;
-  }
+
 
 
 

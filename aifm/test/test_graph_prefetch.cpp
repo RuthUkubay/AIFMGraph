@@ -231,6 +231,15 @@ static inline void bin_frontier(std::vector<Vid>& curr,
   }
   curr.swap(tmp);
 }
+// ---- add this near the top (global scope), before any BFS uses it ----
+static inline void do_edge_work(volatile uint32_t &sink, Vid v, uint32_t edge_work) {
+  // tiny integer-mix loop to simulate per-edge compute
+  uint32_t x = static_cast<uint32_t>(v) ^ 0x9e3779b9u;
+  for (uint32_t i = 0; i < edge_work; ++i) {
+    x = x * 1664525u + 1013904223u + i;
+  }
+  sink ^= x;  // keep it “live”
+}
 
 // BFS with optional tiny tail prefetch and tunable per-edge compute.
 static double bfs_time_us_with_work(GraphAdj &G, Vid src,
@@ -517,7 +526,7 @@ static void _main(void*) {
             "BFS per-iter (µs),Speedup vs baseline (same EdgeWork)\n";
 
     const uint32_t work_levels[] = {0, 64, 256};    // try no work, light work, heavier work
-    const uint32_t tailpeeks[]   = {0, 1, 2};       // baseline, tailpeek(1), tailpeek(2)
+    // const uint32_t tailpeeks[]   = {0, 1, 2};       // baseline, tailpeek(1), tailpeek(2)
 
     for (uint32_t work : work_levels) {
     // --- All-remote group ---
