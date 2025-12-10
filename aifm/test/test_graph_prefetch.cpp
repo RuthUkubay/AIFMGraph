@@ -1,4 +1,3 @@
-// aifm/test/test_graph_prefetch.cpp
 extern "C" {
 #include <runtime/runtime.h>
 }
@@ -15,6 +14,7 @@ extern "C" {
 #include <memory>
 #include <queue>
 #include <random>
+#include <thread>
 #include <vector>
 
 using namespace far_memory;
@@ -35,9 +35,7 @@ struct Local8 : RemotingPolicy {
   }
 };
 
-/* ------------------- A graph with spatially local tails ------------------- */
-// "Banded" generator: neighbors of u mostly sit in [u, u+W), making tails
-// contiguous-ish so prefetch/warm can help.
+/* ------------------- Banded edges (spatial locality) ------------------- */
 static std::vector<std::pair<Vid,Vid>>
 gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
   std::mt19937_64 rng(seed);
@@ -48,29 +46,16 @@ gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
   edges.reserve(E);
   for (uint64_t i = 0; i < E; ++i) {
     Vid u = static_cast<Vid>(Uv(rng));
-    Vid v = static_cast<Vid>((u + Uw(rng)) % N); // keep neighbors near u
+    Vid v = static_cast<Vid>((u + Uw(rng)) % N);
     if (v == u) v = (u + 1) % N;
     edges.emplace_back(u, v);
   }
   return edges;
 }
 
-/* ------------------- RAII prefetch guard (scoped) ------------------- */
-struct PrefetchGuard {
-  GraphAdj &G;
-  bool armed;
-  explicit PrefetchGuard(GraphAdj &g, uint32_t distance)
-      : G(g), armed(distance > 0) {
-    if (armed) G.enable_header_static_prefetch(distance);
-  }
-  ~PrefetchGuard() {
-    if (armed) G.disable_header_prefetch();
-  }
-};
-
 /* ------------------- BFS variants ------------------- */
 
-// Baseline BFS: plain queue, no prefetch.
+// Plain BFS
 static std::vector<int> bfs_baseline(GraphAdj &G, Vid src) {
   const uint64_t n = G.num_vertices();
   std::vector<int> dist(n, -1);
@@ -95,11 +80,12 @@ static std::vector<int> bfs_baseline(GraphAdj &G, Vid src) {
   return dist;
 }
 
-// Header-prefetch BFS: process vertices in ascending ID per "level"
-// AND enable static prefetch on headers.
-static std::vector<int> bfs_header_prefetch(GraphAdj &G, Vid src, uint32_t pf_dist) {
-  PrefetchGuard guard(G, pf_dist);  // scoped: on enter/exit
-
+// Synchronous-warm BFS:
+//  (a) sort current work by vertex id → sequential header touches
+//  (b) warm headers (deref) for the batch
+//  (c) optionally warm first K entries of each tail
+static std::vector<int> bfs_sync_warm(GraphAdj &G, Vid src,
+                                      uint32_t tail_peek_k) {
   const uint64_t n = G.num_vertices();
   std::vector<int> dist(n, -1);
   if (src >= n) return dist;
@@ -109,55 +95,23 @@ static std::vector<int> bfs_header_prefetch(GraphAdj &G, Vid src, uint32_t pf_di
   dist[src] = 0; curr.push_back(src);
 
   while (!curr.empty()) {
-    // Make header access nearly sequential → helps static prefetch.
     std::sort(curr.begin(), curr.end());
 
-    for (Vid u : curr) {
-      DerefScope s;
-      auto nv = G.neighbors(u, s);
-      for (uint32_t i = 0; i < nv.inline_len; ++i) {
-        Vid v = nv.inline_ptr[i];
-        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
-      }
-      for (uint32_t i = 0; i < nv.tail_len; ++i) {
-        Vid v = nv.tail_ptr[i];
-        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
-      }
+    // warm headers for this batch
+    {
+      std::vector<uint64_t> batch(curr.begin(), curr.end());
+      G.warm_headers_sorted_span(batch.data(), (uint32_t)batch.size());
     }
-    curr.swap(next);
-    next.clear();
-  }
-  return dist;
-}
 
-// Header + tiny tail warmup: like above, but “peek” K tail entries first.
-static std::vector<int> bfs_header_and_tail_warm(GraphAdj &G, Vid src,
-                                                 uint32_t pf_dist,
-                                                 uint32_t peek_k) {
-  PrefetchGuard guard(G, pf_dist);  // scoped: on enter/exit
+    // warm tiny prefix of tails
+    if (tail_peek_k > 0) {
+      for (Vid u : curr) G.warm_tail_prefix(u, tail_peek_k);
+    }
 
-  const uint64_t n = G.num_vertices();
-  std::vector<int> dist(n, -1);
-  if (src >= n) return dist;
-
-  std::vector<Vid> curr, next;
-  curr.reserve(1024); next.reserve(1024);
-  dist[src] = 0; curr.push_back(src);
-
-  while (!curr.empty()) {
-    std::sort(curr.begin(), curr.end());
-
+    // expand
     for (Vid u : curr) {
       DerefScope s;
       auto nv = G.neighbors(u, s);
-
-      // Warm a few tail entries (bounded).
-      uint32_t warm = std::min(peek_k, nv.tail_len);
-      for (uint32_t i = 0; i < warm; ++i) {
-        volatile Vid tmp = nv.tail_ptr[i];
-        (void)tmp;
-      }
-
       for (uint32_t i = 0; i < nv.inline_len; ++i) {
         Vid v = nv.inline_ptr[i];
         if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
@@ -174,35 +128,29 @@ static std::vector<int> bfs_header_and_tail_warm(GraphAdj &G, Vid src,
 }
 
 /* ------------------- Harness ------------------- */
-
 struct RunCfg {
   const char* name;
   const RemotingPolicy& pol;
-  uint32_t pf_distance; // 0 = no prefetch
   uint32_t tail_peek;   // 0 = no tail warm
 };
 
 static void time_and_report(GraphAdj& G, Vid src,
                             uint32_t iters,
-                            uint32_t pf_distance,
                             uint32_t tail_peek,
-                            double &out_us) {
+                            double &out_us,
+                            bool use_sync_warm) {
   using clk = std::chrono::high_resolution_clock;
 
-  // Warm
-  (void)(pf_distance == 0 && tail_peek == 0
-         ? bfs_baseline(G, src)
-         : (tail_peek == 0 ? bfs_header_prefetch(G, src, pf_distance)
-                           : bfs_header_and_tail_warm(G, src, pf_distance, tail_peek)));
+  // Warm once
+  (void)(use_sync_warm ? bfs_sync_warm(G, src, tail_peek)
+                       : bfs_baseline(G, src));
 
   auto t0 = clk::now();
   for (uint32_t i = 0; i < iters; ++i) {
-    if (pf_distance == 0 && tail_peek == 0) {
-      (void)bfs_baseline(G, src);
-    } else if (tail_peek == 0) {
-      (void)bfs_header_prefetch(G, src, pf_distance);
+    if (use_sync_warm) {
+      (void)bfs_sync_warm(G, src, tail_peek);
     } else {
-      (void)bfs_header_and_tail_warm(G, src, pf_distance, tail_peek);
+      (void)bfs_baseline(G, src);
     }
   }
   auto t1 = clk::now();
@@ -211,26 +159,22 @@ static void time_and_report(GraphAdj& G, Vid src,
 }
 
 static void do_work(FarMemManager* mgr) {
-  // Make a workload where prefetch can help:
-  // - banded tails → spatial locality
-  // - level-sorted BFS → header stride = 1
   const uint64_t N = 200000;
   const uint64_t E = 1200000;
-  const uint32_t W = 64;     // band window (neighbors near u)
+  const uint32_t W = 64;     // band window
   const uint32_t iters = 5;
   auto edges = gen_banded_edges(N, E, W);
 
   AllRemote all_remote;
   Local8    local_8;
 
+  // Runs: baseline vs synchronous warm (peek K tail entries)
   RunCfg runs[] = {
-    {"All-remote / baseline",               all_remote, 0,   0},
-    {"All-remote / header-pf(d=64)",        all_remote, 64,  0},
-    {"All-remote / header-pf+tail-peek(4)", all_remote, 64,  4},
+    {"All-remote / baseline",            all_remote, 0},
+    {"All-remote / sync-warm + tail(4)", all_remote, 4},
 
-    {"Local-8 / baseline",                  local_8,    0,   0},
-    {"Local-8 / header-pf(d=64)",           local_8,    64,  0},
-    {"Local-8 / header-pf+tail-peek(4)",    local_8,    64,  4},
+    {"Local-8 / baseline",               local_8,    0},
+    {"Local-8 / sync-warm + tail(4)",    local_8,    4},
   };
 
   cout << "Graph: |V|=" << N << " |E|=" << E
@@ -252,14 +196,31 @@ static void do_work(FarMemManager* mgr) {
       }
     }
 
-    double us = 0.0;
-    time_and_report(G, /*src=*/0, iters, cfg.pf_distance, cfg.tail_peek, us);
+    double base_us = 0.0, warm_us = 0.0;
+
+    time_and_report(G, /*src=*/0, iters,
+                    /*tail_peek=*/cfg.tail_peek, base_us,
+                    /*use_sync_warm=*/false);
+
+    // small pause to let GC settle before next timed path on the same G
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    time_and_report(G, /*src=*/0, iters,
+                    /*tail_peek=*/cfg.tail_peek, warm_us,
+                    /*use_sync_warm=*/true);
 
     cout << cfg.name
          << " | inline_any=" << inline_any
          << " remote_any=" << remote_any
          << " remote_bytes=" << remote_bytes
-         << " | BFS per-iter (µs)=" << us << "\n";
+         << " | BFS baseline_us=" << base_us
+         << " | sync_warm_us=" << warm_us
+         << " | delta=" << (base_us - warm_us)
+         << " (" << (100.0 * (base_us - warm_us) / base_us) << "% faster)"
+         << "\n";
+
+    // extra pause before destroying G to be extra safe on devices
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   cout << "Done.\n";
 }

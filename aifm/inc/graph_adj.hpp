@@ -30,11 +30,9 @@ struct VertexHdr {
   uint32_t degree{0};
   uint16_t inline_len{0};
 
-  // Small inline buffer to avoid a remote touch for tiny adjacency lists
   static constexpr uint16_t kInlineCap = 8;
-  Vid inline_small[kInlineCap]{};   // zero-initialized
-  // Remote tail (degree - inline_len) * sizeof(Vid) bytes if any
-  mutable GenericUniquePtr tail;
+  Vid inline_small[kInlineCap]{};    // zero-initialized
+  mutable GenericUniquePtr tail;     // (degree - inline_len) * sizeof(Vid) bytes if any
 };
 
 /* ---------- Array of headers (one object per vertex) ---------- */
@@ -61,14 +59,10 @@ public:
 
   inline uint64_t num_vertices() const { return verts_.size(); }
 
-  /**
-   * Build from edge list (directed). Assumes vertices are in [0, N).
-   * Two-pass: (1) degree count, (2) write headers & allocate/fill tails.
-   */
   inline void build_from_edges(const std::vector<std::pair<Vid, Vid>>& edges) {
     const uint64_t N = verts_.size();
 
-    // 1) host-side degree count
+    // 1) degree count
     std::vector<uint32_t> deg(N, 0);
     for (auto [u, v] : edges) { assert(u < N && v < N); ++deg[u]; }
 
@@ -77,10 +71,7 @@ public:
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
         auto &vh = deref_vertex(scope, u);
-
-        // Full value-init to avoid stale bits in inline_small/tail
-        vh = VertexHdr{};
-
+        vh = VertexHdr{};                 // value-init, clears inline_small & tail
         vh.degree = deg[u];
         if (vh.degree == 0) continue;
 
@@ -92,7 +83,7 @@ public:
           const uint16_t bytes = static_cast<uint16_t>(tail_deg * sizeof(Vid));
           vh.tail = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, bytes);
         } else {
-          vh.tail = GenericUniquePtr{}; // empty
+          vh.tail = GenericUniquePtr{};
         }
       }
     }
@@ -128,7 +119,6 @@ public:
     uint32_t   tail_len{0};
   };
 
-  /** Read-only neighbor view for vertex u (valid while 'scope' lives). */
   inline NeighborView neighbors(uint64_t u, DerefScope& scope) const {
     const auto &vh = const_deref_vertex(scope, u);
     NeighborView nv;
@@ -155,30 +145,28 @@ public:
     return const_deref_vertex(scope, u).degree;
   }
 
-  /* ---------- Prefetch helpers ---------- */
+  // Synchronous “warm” helpers (safe; no background state)
 
-  // Configure static prefetch over headers: stride 1, lookahead = distance.
-  inline void enable_header_static_prefetch(uint32_t distance) {
-    if (distance == 0) return;
-    verts_.static_prefetch(/*start=*/0, /*step=*/1, /*num=*/distance);
+  // Touch a batch of headers (sequential deref) to bring them into cache now.
+  inline void warm_headers_sorted_span(uint64_t const* sorted_idx, uint32_t num) {
+    DerefScope s;
+    for (uint32_t i = 0; i < num; ++i) {
+      (void) const_deref_vertex(s, sorted_idx[i]);
+    }
   }
 
-  // Disable/cancel any static prefetch configured on the header array.
-  inline void disable_header_prefetch() {
-    verts_.disable_prefetch();
-  }
-
-  // Optional: prefetch a span of headers manually.
-  inline void prefetch_headers_span(uint64_t start, uint32_t num) {
-    if (num == 0) return;
-    verts_.static_prefetch(start, /*step=*/1, num);
-  }
-
-  // Optional: hint a tail should be present (per-vertex warm).
-  inline void hint_tail_present(uint64_t u) {
+  // For a vertex u, touch first K entries of the remote tail (if any).
+  inline void warm_tail_prefix(uint64_t u, uint32_t k) {
     DerefScope s;
     const auto &vh = const_deref_vertex(s, u);
-    if (vh.degree > vh.inline_len) (void)vh.tail.deref(s);
+    const uint32_t tail_deg = (vh.degree > vh.inline_len)
+                            ? (vh.degree - vh.inline_len) : 0;
+    if (!tail_deg) return;
+    const uint32_t warm = std::min<uint32_t>(k, tail_deg);
+    const Vid* base = reinterpret_cast<const Vid*>(vh.tail.deref(s));
+    for (uint32_t i = 0; i < warm; ++i) {
+      volatile Vid tmp = base[i]; (void)tmp;
+    }
   }
 
 private:
@@ -186,12 +174,10 @@ private:
   const RemotingPolicy& policy_;
   VertexArray    verts_;
 
-  // Map header for mutation
   inline VertexHdr& deref_vertex(const DerefScope& scope, uint64_t i) {
     void* p = verts_.slot(i)->deref_mut(scope);
     return *reinterpret_cast<VertexHdr*>(p);
   }
-  // Map header read-only
   inline const VertexHdr& const_deref_vertex(const DerefScope& scope, uint64_t i) const {
     auto* h = verts_.slot(i);
     const void* p = h->deref(scope);
