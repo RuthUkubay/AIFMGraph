@@ -24,7 +24,7 @@ using std::endl;
 static std::atomic<uint64_t> wb_count{0};
 
 // Keep the “FakeDevice-level” simplicity and sizes similar to your array test.
-constexpr uint64_t kCacheSize    = (1ULL << 20); // 128 MB local cache
+constexpr uint64_t kCacheSize    = (32ULL << 20); // 128 MB local cache
 constexpr uint64_t kFarMemSize   = (4ULL  << 30);  // 4 GB far memory
 constexpr uint32_t kNumGCThreads = 12;
 
