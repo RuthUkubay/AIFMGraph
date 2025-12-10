@@ -47,56 +47,48 @@ static std::vector<std::pair<Vid,Vid>> gen_random_edges(const GenParams& p) {
   return edges;
 }
 
-static void sanity_check(GraphAdj& G, const std::vector<std::pair<Vid,Vid>>& edges) {
+static void sanity_check(far_memory::GraphAdj& G,
+                         const std::vector<std::pair<Vid,Vid>>& edges) {
   const uint64_t N = G.num_vertices();
 
-  // total degree check
+  // Check total degree sum equals |E|
   uint64_t sum_deg = 0;
   for (uint64_t u = 0; u < N; ++u) {
-    DerefScope s;
+    far_memory::DerefScope s;
     sum_deg += G.degree(u, s);
   }
   if (sum_deg != edges.size()) {
-    cout << "Sanity failed: sum_deg=" << sum_deg
-         << " edges=" << edges.size() << endl;
+    std::cout << "Sanity failed: sum_deg=" << sum_deg
+              << " edges=" << edges.size() << std::endl;
   }
 
-  // touch a few neighbor entries (inline and tail) for first few vertices
+  // Spot-check: touch up to 3 neighbors per first few vertices
   for (uint64_t u = 0; u < std::min<uint64_t>(N, 5); ++u) {
-    DerefScope s;
-    auto view = G.neighbors(u, s);
-
-    for (uint32_t i = 0; i < std::min<uint32_t>(view.inline_len, 3u); ++i) {
-      volatile Vid v = view.inline_ptr[i]; (void)v;
-    }
-    for (uint32_t i = 0; i < std::min<uint32_t>(view.tail_len, 3u); ++i) {
-      volatile Vid v = view.tail_ptr[i]; (void)v;
-    }
+    far_memory::DerefScope s;
+    int seen = 0;
+    G.for_each_neighbor(u, s, [&](Vid v) {
+      volatile Vid tmp = v; (void)tmp; // prevent optimizing away
+      if (++seen >= 3) return;
+    });
   }
 }
 
 // Minimal BFS that understands inline + tail layout
-static std::vector<int> bfs(GraphAdj& G, Vid src) {
+static std::vector<int> bfs(far_memory::GraphAdj& G, far_memory::Vid src) {
   const uint64_t n = G.num_vertices();
   std::vector<int> dist(n, -1);
   if (src >= n) return dist;
 
-  std::queue<Vid> q;
+  std::queue<far_memory::Vid> q;
   dist[src] = 0; q.push(src);
 
   while (!q.empty()) {
-    Vid u = q.front(); q.pop();
-    DerefScope scope;
-    auto view = G.neighbors(u, scope);
+    far_memory::Vid u = q.front(); q.pop();
+    far_memory::DerefScope scope;
 
-    for (uint32_t i = 0; i < view.inline_len; ++i) {
-      Vid v = view.inline_ptr[i];
+    G.for_each_neighbor(u, scope, [&](far_memory::Vid v) {
       if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    }
-    for (uint32_t i = 0; i < view.tail_len; ++i) {
-      Vid v = view.tail_ptr[i];
-      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    }
+    });
   }
   return dist;
 }
