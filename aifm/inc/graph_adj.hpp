@@ -20,30 +20,31 @@ namespace far_memory {
 
 using Vid = uint32_t;
 
-/* Placement policy: how many neighbors to keep inline per vertex */
+/* How many neighbors to keep inline per vertex */
 struct RemotingPolicy {
   virtual ~RemotingPolicy() = default;
   virtual uint16_t inline_capacity(Vid u, uint32_t degree) const = 0;
 };
 
-/* Per-vertex header */
+/* Per-vertex header: POD only (safe for far-memory moves) */
 struct VertexHdr {
   uint32_t degree{0};
   uint16_t inline_len{0};
 
   static constexpr uint16_t kInlineCap = 8;
-  Vid inline_small[kInlineCap]{}; // tiny adjacency in the header
+  Vid inline_small[kInlineCap]{};   // tiny adjacency in the header
 
-  // Tail is split into multiple far-memory chunks so we never exceed
-  // a small per-object size. Each chunk records its size in bytes.
+  /* Tail is stored in fixed chunks (no std::vector to keep POD) */
   struct TailChunk {
-    mutable GenericUniquePtr ptr;  // <-- mutable so const methods can deref()
-    uint32_t bytes{0};             // multiple of sizeof(Vid)
+    mutable GenericUniquePtr ptr;   // deref() is non-const -> handle must be mutable
+    uint16_t bytes{0};              // <= 60 KiB, multiple of sizeof(Vid)
   };
-  mutable std::vector<TailChunk> tail_chunks;
+  static constexpr uint16_t kMaxTailChunks = 8; // plenty for our degrees
+  uint16_t num_chunks{0};
+  TailChunk chunks[kMaxTailChunks]{};
 };
 
-/* Array of headers (one object per vertex) */
+/* Array of headers (one far object per vertex) */
 class VertexArray : public GenericArray {
 public:
   inline VertexArray(FarMemManager* mgr, uint64_t n_vertices)
@@ -56,7 +57,7 @@ public:
   inline uint64_t size() const { return kNumItems_; }
 };
 
-/* Graph: adjacency lists over AIFM */
+/* Graph: adjacency lists over AIFM (pointer-chasing) */
 class GraphAdj {
 public:
   inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices,
@@ -65,7 +66,7 @@ public:
 
   inline uint64_t num_vertices() const { return verts_.size(); }
 
-  /* Build from directed edge list. Robust via chunked tails. */
+  /* Build from directed edges; tail is chunked to respect handle size */
   inline void build_from_edges(const std::vector<std::pair<Vid, Vid>>& edges) {
     const uint64_t N = verts_.size();
 
@@ -73,40 +74,41 @@ public:
     std::vector<uint32_t> deg(N, 0);
     for (auto [u, v] : edges) { (void)v; assert(u < N); ++deg[u]; }
 
-    // 2a) write headers & allocate tails (chunked)
+    // 2a) headers & tail chunks
     {
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
         auto &vh = deref_vertex(scope, u);
-        vh = VertexHdr{};           // value-init (clears tail_chunks etc.)
+        vh = VertexHdr{};           // value-init (POD safe)
         vh.degree = deg[u];
-
         if (vh.degree == 0) continue;
 
         const uint16_t wish = policy_.inline_capacity((Vid)u, vh.degree);
         vh.inline_len = std::min<uint16_t>(wish, VertexHdr::kInlineCap);
 
         const uint32_t tail_deg = vh.degree - vh.inline_len;
-        vh.tail_chunks.clear();
+        vh.num_chunks = 0;
+
         if (tail_deg > 0) {
-          // Keep chunk sizes modest (e.g., 60 KiB) to be safe.
-          static constexpr uint32_t kMaxChunkBytes = 60 * 1024;
-          uint32_t bytes_total = tail_deg * sizeof(Vid);
-          while (bytes_total > 0) {
-            const uint32_t this_bytes =
-                (bytes_total > kMaxChunkBytes) ? kMaxChunkBytes : bytes_total;
-            VertexHdr::TailChunk c;
-            c.bytes = this_bytes;
-            c.ptr = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID,
-                                                      static_cast<uint16_t>(c.bytes));
-            vh.tail_chunks.emplace_back(std::move(c));
-            bytes_total -= this_bytes;
+          static constexpr uint32_t kMaxChunkBytes = 60 * 1024; // 60 KiB
+          uint32_t bytes_left = tail_deg * sizeof(Vid);
+
+          while (bytes_left > 0) {
+            assert(vh.num_chunks < VertexHdr::kMaxTailChunks &&
+                   "degree too large for fixed chunk slots");
+            const uint32_t take = std::min<uint32_t>(bytes_left, kMaxChunkBytes);
+
+            auto &c = vh.chunks[vh.num_chunks++];
+            c.bytes = static_cast<uint16_t>(take); // <= 60 KiB fits uint16_t
+            c.ptr   = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, c.bytes);
+
+            bytes_left -= take;
           }
         }
       }
     }
 
-    // 2b) fill inline then tail (across chunks)
+    // 2b) fill inline then tail across chunks
     std::vector<uint32_t> cur(N, 0);
     {
       DerefScope scope;
@@ -117,15 +119,14 @@ public:
         if (cur[u] < vh.inline_len) {
           vh.inline_small[cur[u]++] = v;
         } else {
-          const uint32_t tail_idx = cur[u] - vh.inline_len;
-          write_tail_vid(vh, scope, tail_idx, v);
+          write_tail_vid(vh, scope, cur[u] - vh.inline_len, v);
           ++cur[u];
         }
       }
     }
   }
 
-  /* Header info for stats */
+  /* Header info (for stats) */
   struct HeaderInfo { uint32_t degree; uint16_t inline_len; };
   inline HeaderInfo header_info(uint64_t u, DerefScope &scope) const {
     const auto &vh = const_deref_vertex(scope, u);
@@ -136,40 +137,36 @@ public:
     return const_deref_vertex(scope, u).degree;
   }
 
-  /* ===== Safe iterator over all neighbors (inline + all tail chunks) ===== */
+  /* ===== Iterator over ALL neighbors (inline + all tail chunks) ===== */
   template <typename F>
   inline void for_each_neighbor(uint64_t u, DerefScope& scope, F&& f) const {
     const auto &vh = const_deref_vertex(scope, u);
-    // inline part
-    for (uint32_t i = 0; i < vh.inline_len; ++i) {
-      f(vh.inline_small[i]);
-    }
-    // tail chunks
+
+    for (uint32_t i = 0; i < vh.inline_len; ++i) f(vh.inline_small[i]);
+
     const uint32_t tail_deg =
         (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
     if (tail_deg == 0) return;
 
-    uint32_t emitted = 0;
-    for (const auto& c : vh.tail_chunks) {
-      if (emitted >= tail_deg) break;
-      const void* raw = c.ptr.deref(scope); // OK: ptr is mutable; deref() returns const void*
+    uint32_t seen = 0;
+    for (uint16_t k = 0; k < vh.num_chunks && seen < tail_deg; ++k) {
+      const auto &c = vh.chunks[k];
+      const void* raw  = c.ptr.deref(scope);              // const deref OK
       const auto* base = static_cast<const uint8_t*>(raw);
-      const Vid*   vptr = reinterpret_cast<const Vid*>(base);
+      const Vid* vptr  = reinterpret_cast<const Vid*>(base);
       const uint32_t entries = c.bytes / sizeof(Vid);
-      const uint32_t todo = std::min(entries, tail_deg - emitted);
+      const uint32_t todo = std::min(entries, tail_deg - seen);
       for (uint32_t i = 0; i < todo; ++i) f(vptr[i]);
-      emitted += todo;
+      seen += todo;
     }
   }
 
-  /* ===== Back-compat: neighbors() view used by older tests =====
-     Returns inline span and the FIRST tail chunk (if any) as a span.
-     Tests that just "touch a few entries" will work with this.           */
+  /* ===== Back-compat view for older tests: inline + FIRST tail chunk ===== */
   struct NeighborView {
     const Vid* inline_ptr{nullptr};
     uint32_t   inline_len{0};
     const Vid* tail_ptr{nullptr};
-    uint32_t   tail_len{0}; // length of the first tail chunk only
+    uint32_t   tail_len{0}; // first tail chunk only
   };
 
   inline NeighborView neighbors(uint64_t u, DerefScope& scope) const {
@@ -180,9 +177,10 @@ public:
 
     const uint32_t tail_deg =
         (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
-    if (tail_deg > 0 && !vh.tail_chunks.empty()) {
-      const auto &c0 = vh.tail_chunks[0];
-      const void* raw = c0.ptr.deref(scope);
+
+    if (tail_deg > 0 && vh.num_chunks > 0) {
+      const auto &c0 = vh.chunks[0];
+      const void* raw  = c0.ptr.deref(scope);
       const auto* base = static_cast<const uint8_t*>(raw);
       nv.tail_ptr = reinterpret_cast<const Vid*>(base);
       const uint32_t entries = c0.bytes / sizeof(Vid);
@@ -191,7 +189,7 @@ public:
     return nv;
   }
 
-  /* Prefetch helpers (headers only; tails on demand) */
+  /* Prefetch helpers (headers only; tails are touched on demand) */
   inline void prefetch_headers_span(uint64_t start, uint32_t num) {
     if (num == 0) return;
     verts_.static_prefetch(start, /*step=*/1, num);
@@ -205,7 +203,7 @@ public:
   inline void hint_tail_present(uint64_t u) {
     DerefScope s;
     const auto &vh = const_deref_vertex(s, u);
-    if (!vh.tail_chunks.empty()) (void)vh.tail_chunks[0].ptr.deref(s);
+    if (vh.num_chunks > 0) (void)vh.chunks[0].ptr.deref(s);
   }
 
 private:
@@ -227,10 +225,11 @@ private:
   inline void write_tail_vid(VertexHdr& vh, const DerefScope& scope,
                              uint32_t tail_idx, Vid v) {
     uint32_t idx = tail_idx;
-    for (auto &c : vh.tail_chunks) {
+    for (uint16_t k = 0; k < vh.num_chunks; ++k) {
+      auto &c = vh.chunks[k];
       const uint32_t entries = c.bytes / sizeof(Vid);
       if (idx < entries) {
-        void* raw = c.ptr.deref_mut(scope);
+        void* raw  = c.ptr.deref_mut(scope);
         auto* base = static_cast<uint8_t*>(raw);
         reinterpret_cast<Vid*>(base)[idx] = v;
         return;
