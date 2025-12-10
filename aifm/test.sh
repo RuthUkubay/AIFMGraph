@@ -19,19 +19,17 @@ all_passed=1
 # }
 
 function run_single_test {
-  echo "Running test $1..."
-  rerun_local_iokerneld
-  [[ $1 == *"tcp"* ]] && rerun_mem_server
-
-  # Show stdout+stderr live (left) AND still grep for "Passed" (right).
-  # stdbuf makes line-buffered so you see lines immediately.
-  if stdbuf -oL -eL run_program ./bin/$1 2>&1 \
-      | tee >(cat >&2) | grep -q "Passed"; then
-    say_passed
-  else
-    say_failed
-    all_passed=0
-  fi
+    echo "Running test $1..."
+    rerun_local_iokerneld
+    if [[ $1 == *"tcp"* ]]; then
+    	rerun_mem_server
+    fi
+    if run_program ./bin/$1 | grep -q "Passed"; then
+        say_passed
+    else
+        say_failed
+    	all_passed=0
+    fi
 }
 
 function run_all_tests {
