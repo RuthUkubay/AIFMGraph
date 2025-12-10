@@ -111,6 +111,12 @@ public:
       }
     }
   }
+  
+  inline void prefetch_headers_span(uint64_t start, uint32_t num) const {
+  if (num == 0) return;
+  verts_.static_prefetch(start, /*step=*/1, num);
+}
+
 
   /* Backwards-compatible struct view for callers that used neighbors(). */
   struct NeighborView {

@@ -266,9 +266,45 @@ static double bfs_frontier_sort_adaptive_time_us(GraphAdj &G, Vid src,
 
       // Sort only if BOTH conditions are met
       if (curr.size() >= sort_min_frontier && avg_tail >= tail_threshold) {
-        static thread_local std::vector<Vid> tmp_bin;
-        bin_frontier(curr, tmp_bin, /*block_bits=*/10); // 1024-ID bins
+        // New: only bin if the ID span is wide enough (≥ 8 bins)
+        Vid minv = curr[0], maxv = curr[0];
+        for (Vid v : curr) { if (v < minv) minv = v; if (v > maxv) maxv = v; }
+        const uint32_t block_bits = 10;  // 1024-ID bin
+        const uint32_t first_bin  = minv >> block_bits;
+        const uint32_t last_bin   = maxv >> block_bits;
+        const uint32_t nbins      = last_bin - first_bin + 1;
+
+        if (nbins >= 8) { // span gate
+            static thread_local std::vector<Vid> tmp_bin;
+            bin_frontier(curr, tmp_bin, block_bits);
+            // --- NEW: tiny, bounded header run-ahead prefetch per bin ---
+            const uint32_t pf_batch = 256;   // small & safe
+            uint32_t batches_done = 0;       // cap total work per level
+            Vid last_bin_id = ~Vid(0);
+
+            for (size_t i = 0; i < curr.size() && batches_done < 16; ) {
+            const Vid v        = curr[i];
+            const Vid bin_id   = v >> block_bits;
+
+            // find the contiguous run of this bin
+            size_t j = i + 1;
+            while (j < curr.size() && (curr[j] >> block_bits) == bin_id) ++j;
+
+            // one prefetch at the start of each bin run
+            if (bin_id != last_bin_id) {
+                const uint64_t start = static_cast<uint64_t>(curr[i]);
+                G.prefetch_headers_span(start, pf_batch);
+                last_bin_id = bin_id;
+                ++batches_done;
+            }
+
+            i = j;
+            }
+    // --- end NEW ---
+
         }
+        }
+
 
       // Expand this level
       for (Vid u : curr) {
@@ -412,6 +448,9 @@ static void _main(void*) {
   // ---- Adaptive frontier sort (only when frontier large & tails heavy) ----
     const uint32_t kSortMinFrontier = 20000; // was 4096
     const uint32_t kTailThreshold   = 128;   // was 64
+    // ADD THIS ONE-LINER so we can verify the run-time knobs:
+   std::cout << "frontier-bin(adaptive f>=" << kSortMinFrontier
+            << " tail>=" << kTailThreshold << ")\n";
 
   // All-remote (adaptive)
   {
@@ -438,9 +477,10 @@ static void _main(void*) {
                                                    kSortMinFrontier, kTailThreshold,
                                                    /*iters=*/5);
 
-    cout << "All-remote,frontier-sort(adaptive f>=4096 tail>=64),"
-         << inline_any << "," << remote_any << "," << remote_bytes << ","
-         << us << "\n";
+    cout << "All-remote,frontier-bin(adaptive f>=" << kSortMinFrontier
+     << " tail>=" << kTailThreshold << "),"
+     << inline_any << "," << remote_any << "," << remote_bytes << ","
+     << us << "\n";
   }
 
   // Local-8 (adaptive)
@@ -466,9 +506,10 @@ static void _main(void*) {
                                                    kSortMinFrontier, kTailThreshold,
                                                    /*iters=*/5);
 
-    cout << "Local-8,frontier-sort(adaptive f>=4096 tail>=64),"
-         << inline_any << "," << remote_any << "," << remote_bytes << ","
-         << us << "\n";
+    cout << "Local-8,frontier-bin(adaptive f>=" << kSortMinFrontier
+     << " tail>=" << kTailThreshold << "),"
+     << inline_any << "," << remote_any << "," << remote_bytes << ","
+     << us << "\n";
   }
 
   cout << "Done.\n";
