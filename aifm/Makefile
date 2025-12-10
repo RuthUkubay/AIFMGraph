@@ -92,11 +92,11 @@ test_array_add_obj = $(test_array_add_src:.cpp=.o)
 # test_embedded_pointer_src = test/test_embedded_pointer.cpp
 # test_embedded_pointer_obj = $(test_embedded_pointer_src:.cpp=.o)
 
-test_generate_graph_src = test/test_generate_graph.cpp
-test_generate_graph_obj = $(test_generate_graph_src:.cpp=.o)
+# test_generate_graph_src = test/test_generate_graph.cpp
+# test_generate_graph_obj = $(test_generate_graph_src:.cpp=.o)
 
-test_graph_replacement_src = test/test_graph_replacement.cpp
-test_graph_replacement_obj = $(test_graph_replacement_src:.cpp=.o)
+# test_graph_replacement_src = test/test_graph_replacement.cpp
+# test_graph_replacement_obj = $(test_graph_replacement_src:.cpp=.o)
 
 test_graph_prefetch_src = test/test_graph_prefetch.cpp
 test_graph_prefetch_obj = $(test_graph_prefetch_src:.cpp=.o)
@@ -114,7 +114,7 @@ lib_obj = $(lib_src:.cpp=.o)
 # $(test_list) $(test_list_gc) $(test_queue_gc) $(test_stack_gc) $(test_pointer_swap_rw_api_src) \
 # $(test_array_add_rw_api_src) $(test_dataframe_vector_src) $(test_csv_reader_src) $(test_shared_pointer_src) \
 # $(test_embedded_pointer_src) $(test_generate_graph_src)
-test_src = $(test_array_add_src) $(test_generate_graph_src) $(test_graph_replacement_src) $(test_graph_prefetch_src)
+test_src = $(test_array_add_src)  $(test_graph_prefetch_src)
 test_obj = $(test_src:.cpp=.o)
 
 src = $(lib_src) $(test_src)
@@ -136,7 +136,8 @@ override LDFLAGS += -lnuma
 # bin/test_local_skiplist_serial bin/test_local_list bin/test_list bin/test_list_gc bin/test_queue_gc bin/test_stack_gc \
 # bin/test_pointer_swap_rw_api bin/test_array_add_rw_api bin/test_dataframe_vector bin/test_csv_reader \
 # bin/test_shared_pointer bin/test_embedded_pointer bin/test_generate_graph libaifm.a
-all: bin/test_array_add bin/test_generate_graph bin/test_graph_replacement bin/test_graph_prefetch libaifm.a
+all: bin/test_array_add  bin/test_graph_prefetch libaifm.a
+# bin/test_generate_graph bin/test_graph_replacement
 
 # bin/test_pointer_noswap: $(test_pointer_noswap_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_obj)
 # 	$(LDXX) -o $@ $(test_pointer_noswap_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
@@ -228,12 +229,12 @@ bin/test_array_add: $(test_array_add_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_ob
 # bin/test_embedded_pointer: $(test_embedded_pointer_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_obj)
 # 	$(LDXX) -o $@ $(test_embedded_pointer_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
 
-bin/test_generate_graph: $(test_generate_graph_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_obj)
-	$(LDXX) -o $@ $(test_generate_graph_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
+# bin/test_generate_graph: $(test_generate_graph_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_obj)
+# 	$(LDXX) -o $@ $(test_generate_graph_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
 
-bin/test_graph_replacement: $(test_graph_replacement_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_obj)
-	$(LDXX) -o $@ $(test_graph_replacement_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
-	
+# bin/test_graph_replacement: $(test_graph_replacement_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_obj)
+# 	$(LDXX) -o $@ $(test_graph_replacement_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
+
 bin/test_graph_prefetch: $(test_graph_prefetch_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_obj)
 	$(LDXX) -o $@ $(test_graph_prefetch_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
 

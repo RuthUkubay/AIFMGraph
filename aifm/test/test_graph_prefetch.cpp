@@ -35,35 +35,32 @@ struct Local8 : RemotingPolicy {
   }
 };
 
-/* Banded generator: neighbors of u fall in [u, u+W) */
+/* Random edges (stable and light). */
 static std::vector<std::pair<Vid,Vid>>
-gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed=42) {
+gen_random_edges(uint64_t N, uint64_t E, uint64_t seed=42) {
   std::mt19937_64 rng(seed);
-  std::uniform_int_distribution<uint64_t> Uu(0, N - 1);
-  std::uniform_int_distribution<uint32_t> Uw(0, W - 1);
-
+  std::uniform_int_distribution<uint64_t> U(0, N - 1);
   std::vector<std::pair<Vid,Vid>> edges;
   edges.reserve(E);
   for (uint64_t i = 0; i < E; ++i) {
-    Vid u = static_cast<Vid>(Uu(rng));
-    Vid v = static_cast<Vid>((u + Uw(rng)) % N);
-    if (v == u) v = (u + 1) % N;
+    Vid u = static_cast<Vid>(U(rng));
+    Vid v = static_cast<Vid>(U(rng));
+    if (u == v) v = (u + 1 < N) ? u + 1 : 0;
     edges.emplace_back(u, v);
   }
   return edges;
 }
 
-/* BFS that uses the safe iterator API */
-static double bfs_time_us(GraphAdj &G, Vid src, uint32_t iters) {
+/* ----- BFS variants ----- */
+
+// 1) Baseline BFS (no warm-up)
+static double bfs_baseline_time(GraphAdj &G, Vid src, uint32_t iters) {
   using clk = std::chrono::high_resolution_clock;
   const uint64_t n = G.num_vertices();
-  if (src >= n) return 0.0;
-
   auto run_once = [&](){
     std::vector<int> dist(n, -1);
     std::queue<Vid> q;
     dist[src] = 0; q.push(src);
-
     while (!q.empty()) {
       Vid u = q.front(); q.pop();
       DerefScope s;
@@ -72,9 +69,7 @@ static double bfs_time_us(GraphAdj &G, Vid src, uint32_t iters) {
       });
     }
   };
-
-  // warm
-  run_once();
+  run_once(); // warm
   auto t0 = clk::now();
   for (uint32_t i = 0; i < iters; ++i) run_once();
   auto t1 = clk::now();
@@ -82,27 +77,83 @@ static double bfs_time_us(GraphAdj &G, Vid src, uint32_t iters) {
          / static_cast<double>(iters);
 }
 
-/* run one configuration safely (single construction; no dummy) */
+// 2) Look-ahead header warm: before expanding each u, touch the headers
+// for the next L vertices in this BFS level (if any). This is synchronous,
+// safe, and requires no allocator hints.
+static double bfs_header_lookahead_time(GraphAdj &G, Vid src,
+                                        uint32_t lookahead_L,
+                                        uint32_t iters) {
+  using clk = std::chrono::high_resolution_clock;
+  const uint64_t n = G.num_vertices();
+
+  auto run_once = [&](){
+    std::vector<int> dist(n, -1);
+    std::vector<Vid> curr, next;
+    curr.reserve(1024); next.reserve(1024);
+
+    dist[src] = 0; curr.push_back(src);
+
+    while (!curr.empty()) {
+      // Optional: keep headers somewhat sequential to help cache locality.
+      std::sort(curr.begin(), curr.end());
+
+      for (size_t idx = 0; idx < curr.size(); ++idx) {
+        Vid u = curr[idx];
+
+        // --- tiny, safe "prefetch": header touches for the next L IDs in this level
+        if (lookahead_L) {
+          DerefScope sh;
+          size_t end = std::min(curr.size(), idx + 1 + static_cast<size_t>(lookahead_L));
+          for (size_t j = idx + 1; j < end; ++j) {
+            (void)G.header_info(curr[j], sh); // read-only header map
+          }
+        }
+
+        // expand neighbors
+        DerefScope se;
+        G.for_each_neighbor(u, se, [&](Vid v){
+          if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
+        });
+      }
+      curr.swap(next);
+      next.clear();
+    }
+  };
+
+  run_once(); // warm
+  auto t0 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) run_once();
+  auto t1 = clk::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+         / static_cast<double>(iters);
+}
+
+/* ----- One run row ----- */
 struct Row {
   const char* policy;
-  const char* prefetch;
+  const char* variant;     // "baseline" or "hdr_lookahead(L)"
   uint64_t inline_any;
   uint64_t remote_any;
   uint64_t remote_bytes;
   double   bfs_us;
 };
 
-static Row run_case(FarMemManager* mgr,
-                    uint64_t N,
-                    const std::vector<std::pair<Vid,Vid>>& edges,
-                    const char* policy_name,
-                    const RemotingPolicy& pol,
-                    uint32_t header_pf /*0 = off*/) {
+static Row build_and_run(FarMemManager* mgr,
+                         const std::vector<std::pair<Vid,Vid>>& edges,
+                         const char* policy_name,
+                         const RemotingPolicy& pol,
+                         uint32_t lookaheadL) {
   Row r{};
-  r.policy   = policy_name;
-  r.prefetch = header_pf ? "header(d=64)" : "none";
+  r.policy  = policy_name;
+  r.variant = (lookaheadL == 0) ? "baseline" : "hdr_lookahead";
 
-  // Build exactly once with the known N (no dummy object)
+  // Build once per row
+  const uint64_t N = [&](){
+    Vid maxv=0; for (auto &e : edges) { if (e.first > maxv) maxv=e.first;
+                                        if (e.second> maxv) maxv=e.second; }
+    return static_cast<uint64_t>(maxv) + 1;
+  }();
+
   GraphAdj G(mgr, N, pol);
   G.build_from_edges(edges);
 
@@ -121,48 +172,49 @@ static Row run_case(FarMemManager* mgr,
   r.remote_any   = remote_any;
   r.remote_bytes = remote_bytes;
 
-  if (header_pf) G.enable_header_static_prefetch(header_pf);
-  r.bfs_us = bfs_time_us(G, /*src=*/0, /*iters=*/5);
-  if (header_pf) G.disable_header_prefetch();
+  // time
+  r.bfs_us = (lookaheadL == 0)
+               ? bfs_baseline_time(G, /*src=*/0, /*iters=*/5)
+               : bfs_header_lookahead_time(G, /*src=*/0, lookaheadL, /*iters=*/5);
 
   return r;
 }
 
+/* ----- Driver ----- */
 static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
 
+  // Back to stable scale that never crashed for you.
   const uint64_t N = 200000;
-  const uint64_t E = 3200000;
-  const uint32_t W = 16;
-
-  auto edges = gen_banded_edges(N, E, W);
+  const uint64_t E = 1200000;
+  auto edges = gen_random_edges(N, E);
 
   AllRemote all_remote;
   Local8    local_8;
 
-  cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
-  cout << "Policy,Prefetch,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
+  cout << "Graph: |V|=" << N << " |E|=" << E << "\n";
+  cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
 
-  // All-remote: no prefetch vs header prefetch
+  // All-remote: baseline vs small look-ahead (L=32)
   {
-    Row a = run_case(manager.get(), N, edges, "All-remote", all_remote, 0);
-    cout << a.policy << "," << a.prefetch << "," << a.inline_any << "," << a.remote_any
+    Row a = build_and_run(manager.get(), edges, "All-remote", all_remote, 0);
+    cout << a.policy << "," << a.variant << "," << a.inline_any << "," << a.remote_any
          << "," << a.remote_bytes << "," << a.bfs_us << "\n";
 
-    Row b = run_case(manager.get(), N, edges, "All-remote", all_remote, 64);
-    cout << b.policy << "," << b.prefetch << "," << b.inline_any << "," << b.remote_any
+    Row b = build_and_run(manager.get(), edges, "All-remote", all_remote, 32);
+    cout << b.policy << "," << b.variant << "," << b.inline_any << "," << b.remote_any
          << "," << b.remote_bytes << "," << b.bfs_us << "\n";
   }
 
-  // Local-8: no prefetch vs header prefetch
+  // Local-8: baseline vs small look-ahead (L=32)
   {
-    Row a = run_case(manager.get(), N, edges, "Local-8", local_8, 0);
-    cout << a.policy << "," << a.prefetch << "," << a.inline_any << "," << a.remote_any
+    Row a = build_and_run(manager.get(), edges, "Local-8", local_8, 0);
+    cout << a.policy << "," << a.variant << "," << a.inline_any << "," << a.remote_any
          << "," << a.remote_bytes << "," << a.bfs_us << "\n";
 
-    Row b = run_case(manager.get(), N, edges, "Local-8", local_8, 64);
-    cout << b.policy << "," << b.prefetch << "," << b.inline_any << "," << b.remote_any
+    Row b = build_and_run(manager.get(), edges, "Local-8", local_8, 32);
+    cout << b.policy << "," << b.variant << "," << b.inline_any << "," << b.remote_any
          << "," << b.remote_bytes << "," << b.bfs_us << "\n";
   }
 

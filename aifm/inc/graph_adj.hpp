@@ -20,7 +20,7 @@ namespace far_memory {
 
 using Vid = uint32_t;
 
-/* Placement policy */
+/* Placement policy: how many neighbors to keep inline per vertex */
 struct RemotingPolicy {
   virtual ~RemotingPolicy() = default;
   virtual uint16_t inline_capacity(Vid u, uint32_t degree) const = 0;
@@ -32,11 +32,11 @@ struct VertexHdr {
   uint16_t inline_len{0};
 
   static constexpr uint16_t kInlineCap = 8;
-  Vid inline_small[kInlineCap]{};       // small adjacency in-place
-  mutable GenericUniquePtr tail;        // remaining neighbors, if any
+  Vid inline_small[kInlineCap]{};      // small adjacency in-place
+  mutable GenericUniquePtr tail;       // remaining neighbors (if any)
 };
 
-/* Array of headers (one object per vertex) */
+/* Array of headers (one far-mem object per vertex) */
 class VertexArray : public GenericArray {
 public:
   inline VertexArray(FarMemManager* mgr, uint64_t n_vertices)
@@ -58,6 +58,7 @@ public:
 
   inline uint64_t num_vertices() const { return verts_.size(); }
 
+  /* Build from (u,v) edges. */
   inline void build_from_edges(const std::vector<std::pair<Vid, Vid>>& edges) {
     const uint64_t N = verts_.size();
 
@@ -70,10 +71,7 @@ public:
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
         auto &vh = deref_vertex(scope, u);
-
-        // value-init (safe zeroing)
-        vh = VertexHdr{};
-
+        vh = VertexHdr{};                 // value-init (safe zeroing)
         vh.degree = deg[u];
         if (vh.degree == 0) continue;
 
@@ -82,8 +80,8 @@ public:
 
         const uint32_t tail_deg = vh.degree - vh.inline_len;
         if (tail_deg > 0) {
-          const uint32_t bytes = tail_deg * static_cast<uint32_t>(sizeof(Vid));
-          // allocate with a 32-bit size to avoid truncation
+          // NOTE: 16-bit size to match vanilla pointer expectations.
+          const uint16_t bytes = static_cast<uint16_t>(tail_deg * sizeof(Vid));
           vh.tail = mgr_->allocate_generic_unique_ptr(kVanillaPtrDSID, bytes);
         } else {
           vh.tail = GenericUniquePtr{};
@@ -114,6 +112,32 @@ public:
     }
   }
 
+  /* Backwards-compatible struct view for callers that used neighbors(). */
+  struct NeighborView {
+    const Vid* inline_ptr{nullptr};
+    uint32_t   inline_len{0};
+    const Vid* tail_ptr{nullptr};
+    uint32_t   tail_len{0};
+  };
+
+  /* Optional view API (kept for compatibility with older tests). */
+  inline NeighborView neighbors(uint64_t u, DerefScope& scope) const {
+    const auto &vh = const_deref_vertex(scope, u);
+    NeighborView nv;
+    nv.inline_ptr = vh.inline_small;
+    nv.inline_len = vh.inline_len;
+
+    const uint32_t tail_deg =
+        (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
+    if (tail_deg > 0) {
+      const void *tail_base = vh.tail.deref(scope);   // const-safe read
+      nv.tail_ptr = reinterpret_cast<const Vid*>(tail_base);
+      nv.tail_len = tail_deg;
+    }
+    return nv;
+  }
+
+  /* Header info for stats / warm touches */
   struct HeaderInfo { uint32_t degree; uint16_t inline_len; };
   inline HeaderInfo header_info(uint64_t u, DerefScope &scope) const {
     const auto &vh = const_deref_vertex(scope, u);
@@ -124,37 +148,20 @@ public:
     return const_deref_vertex(scope, u).degree;
   }
 
-  /* Prefetch helpers */
-  inline void prefetch_headers_span(uint64_t start, uint32_t num) {
-    if (num == 0) return;
-    verts_.static_prefetch(start, /*step=*/1, num);
-  }
-  inline void enable_header_static_prefetch(uint32_t distance) {
-    verts_.static_prefetch(/*start=*/0, /*step=*/1, /*num=*/distance);
-  }
-  inline void disable_header_prefetch() {
-    verts_.disable_prefetch();
-  }
-  inline void hint_tail_present(uint64_t u) {
-    DerefScope s;
-    const auto &vh = const_deref_vertex(s, u);
-    if (vh.degree > vh.inline_len) (void)vh.tail.deref(s);
-  }
-
-  /* Iterator-style neighbor walk (safe across layouts) */
+  /* Safe neighbor iterator (works for any placement). */
   template <typename F>
   inline void for_each_neighbor(uint64_t u, DerefScope& scope, F&& fn) const {
     const auto &vh = const_deref_vertex(scope, u);
 
-    // inline part
+    // inline chunk
     for (uint32_t i = 0; i < vh.inline_len; ++i)
       fn(vh.inline_small[i]);
 
-    // tail part (only if exists)
+    // tail chunk (if any)
     const uint32_t tail_deg =
         (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
     if (tail_deg > 0) {
-      const void *base = vh.tail.deref(scope); // safe const deref
+      const void *base = vh.tail.deref(scope);
       const Vid *tp = reinterpret_cast<const Vid*>(base);
       for (uint32_t i = 0; i < tail_deg; ++i)
         fn(tp[i]);
