@@ -102,21 +102,20 @@ static std::vector<int> bfs(GraphAdj &G, Vid src) {
   if (src >= n) return dist;
 
   std::queue<Vid> q;
-  dist[src] = 0; q.push(src);
+  dist[src] = 0; 
+  q.push(src);
 
   while (!q.empty()) {
-    Vid u = q.front(); q.pop();
-    DerefScope scope;
-    auto view = G.neighbors(u, scope);
+    Vid u = q.front(); 
+    q.pop();
 
-    for (uint32_t i = 0; i < view.inline_len; ++i) {
-      Vid v = view.inline_ptr[i];
-      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    }
-    for (uint32_t i = 0; i < view.tail_len; ++i) {
-      Vid v = view.tail_ptr[i];
-      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    }
+    DerefScope scope;
+    G.for_each_neighbor(u, scope, [&](Vid v) {
+      if (dist[v] == -1) {
+        dist[v] = dist[u] + 1;
+        q.push(v);
+      }
+    });
   }
   return dist;
 }
