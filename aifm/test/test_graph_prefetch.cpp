@@ -204,7 +204,7 @@ static double bfs_sorted_frontier_time_us(GraphAdj &G, Vid src, uint32_t iters) 
 static inline void bin_frontier(std::vector<Vid>& curr,
                                 std::vector<Vid>& tmp,
                                 uint32_t block_bits /* e.g., 10 for 1024 */) {
-  const uint32_t B = 1u << block_bits;
+//   const uint32_t B = 1u << block_bits;
   if (curr.empty()) return;
 
   // Find bin range
