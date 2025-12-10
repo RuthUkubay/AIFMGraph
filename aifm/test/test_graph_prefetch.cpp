@@ -103,16 +103,29 @@ static double bfs_tailpeek_time_us(GraphAdj &G, Vid src, uint32_t peek_k, uint32
 
     while (!q.empty()) {
       Vid u = q.front(); q.pop();
-      DerefScope s;
 
-      // **Only now**, because we will expand u, warm a tiny prefix of tail.
-      // This maps the tail and touches K entries at most (bounded cost).
-      G.warm_tail_prefix(u, peek_k, s);
+      // 1) Read header to know actual tail length
+      uint32_t tail_len = 0;
+      {
+        DerefScope hs;
+        auto h = G.header_info(u, hs);
+        tail_len = (h.degree > h.inline_len) ? (h.degree - h.inline_len) : 0;
+      }
 
-      // Then do the regular neighbor iteration.
-      G.for_each_neighbor(u, s, [&](Vid v){
-        if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-      });
+      // 2) Warm only a capped prefix, using its own scope
+      if (tail_len > 0 && peek_k > 0) {
+        const uint32_t k = (peek_k < tail_len) ? peek_k : tail_len;
+        DerefScope ws;
+        G.warm_tail_prefix(u, k, ws);
+      }
+
+      // 3) Traverse in a fresh scope
+      {
+        DerefScope s;
+        G.for_each_neighbor(u, s, [&](Vid v){
+          if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+        });
+      }
     }
   };
 
@@ -123,7 +136,6 @@ static double bfs_tailpeek_time_us(GraphAdj &G, Vid src, uint32_t peek_k, uint32
   return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
          / static_cast<double>(iters);
 }
-
 // Gated tail warm-up: if a vertex has a large enough remote tail,
 // call hint_tail_present(u) first (to start the fetch), then iterate neighbors.
 // Tail threshold keeps it cheap and focused on vertices where it matters.
@@ -253,30 +265,38 @@ static double bfs_time_us_with_work(GraphAdj &G, Vid src,
   auto run_once = [&](){
     std::vector<int> dist(n, -1);
     std::queue<Vid> q;
-    volatile uint32_t sink = 0;     // accumulates "work" to avoid DCE
+    volatile uint32_t sink = 0;  // keep work "live"
     dist[src] = 0; q.push(src);
 
     while (!q.empty()) {
       Vid u = q.front(); q.pop();
-      DerefScope s;
 
-      if (peek_k) {
-        // Warm a tiny prefix of the tail *right before* using it.
-        G.warm_tail_prefix(u, peek_k, s);
+      // Header check to cap K
+      uint32_t tail_len = 0;
+      {
+        DerefScope hs;
+        auto h = G.header_info(u, hs);
+        tail_len = (h.degree > h.inline_len) ? (h.degree - h.inline_len) : 0;
+      }
+      if (peek_k && tail_len) {
+        const uint32_t k = (peek_k < tail_len) ? peek_k : tail_len;
+        DerefScope ws;             // separate scope for warming
+        G.warm_tail_prefix(u, k, ws);
       }
 
-      G.for_each_neighbor(u, s, [&](Vid v){
-        // Do the same compute amount irrespective of visited-ness
-        // so comparisons are apples-to-apples across variants.
-        do_edge_work(sink, v, edge_work);
-
-        if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-      });
+      // Traverse with a fresh scope
+      {
+        DerefScope s;
+        G.for_each_neighbor(u, s, [&](Vid v){
+          // simulate per-edge compute regardless of visited-ness
+          do_edge_work(sink, v, edge_work);
+          if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+        });
+      }
     }
   };
 
-  // Warm run
-  run_once();
+  run_once(); // warm
   auto t0 = clk::now();
   for (uint32_t i = 0; i < iters; ++i) run_once();
   auto t1 = clk::now();
