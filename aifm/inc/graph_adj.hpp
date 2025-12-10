@@ -35,10 +35,10 @@ struct VertexHdr {
   Vid inline_small[kInlineCap]{}; // tiny adjacency in the header
 
   // Tail is split into multiple far-memory chunks so we never exceed
-  // the per-object 64KiB limit. Each chunk records its size.
+  // a small per-object size. Each chunk records its size in bytes.
   struct TailChunk {
-    GenericUniquePtr ptr;
-    uint32_t bytes{0}; // <= 65535 always
+    mutable GenericUniquePtr ptr;  // <-- mutable so const methods can deref()
+    uint32_t bytes{0};             // multiple of sizeof(Vid)
   };
   mutable std::vector<TailChunk> tail_chunks;
 };
@@ -65,7 +65,7 @@ public:
 
   inline uint64_t num_vertices() const { return verts_.size(); }
 
-  /* Build from directed edge list. Robust to very high degrees (chunks). */
+  /* Build from directed edge list. Robust via chunked tails. */
   inline void build_from_edges(const std::vector<std::pair<Vid, Vid>>& edges) {
     const uint64_t N = verts_.size();
 
@@ -78,7 +78,7 @@ public:
       DerefScope scope;
       for (uint64_t u = 0; u < N; ++u) {
         auto &vh = deref_vertex(scope, u);
-        vh = VertexHdr{};                // full value-init (clears tail_chunks)
+        vh = VertexHdr{};           // value-init (clears tail_chunks etc.)
         vh.degree = deg[u];
 
         if (vh.degree == 0) continue;
@@ -89,8 +89,8 @@ public:
         const uint32_t tail_deg = vh.degree - vh.inline_len;
         vh.tail_chunks.clear();
         if (tail_deg > 0) {
-          // Chunk to <= 64KiB each (stay well below 65535 to be safe).
-          static constexpr uint32_t kMaxChunkBytes = 60 * 1024; // 60 KiB
+          // Keep chunk sizes modest (e.g., 60 KiB) to be safe.
+          static constexpr uint32_t kMaxChunkBytes = 60 * 1024;
           uint32_t bytes_total = tail_deg * sizeof(Vid);
           while (bytes_total > 0) {
             const uint32_t this_bytes =
@@ -136,7 +136,7 @@ public:
     return const_deref_vertex(scope, u).degree;
   }
 
-  /* Iterator: call f(Vid) for every neighbor of u (inline then tail chunks). */
+  /* ===== Safe iterator over all neighbors (inline + all tail chunks) ===== */
   template <typename F>
   inline void for_each_neighbor(uint64_t u, DerefScope& scope, F&& f) const {
     const auto &vh = const_deref_vertex(scope, u);
@@ -145,14 +145,15 @@ public:
       f(vh.inline_small[i]);
     }
     // tail chunks
-    uint32_t emitted = 0;
     const uint32_t tail_deg =
         (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
     if (tail_deg == 0) return;
 
+    uint32_t emitted = 0;
     for (const auto& c : vh.tail_chunks) {
       if (emitted >= tail_deg) break;
-      const auto* base = static_cast<const uint8_t*>(c.ptr.deref(scope));
+      const void* raw = c.ptr.deref(scope); // OK: ptr is mutable; deref() returns const void*
+      const auto* base = static_cast<const uint8_t*>(raw);
       const Vid*   vptr = reinterpret_cast<const Vid*>(base);
       const uint32_t entries = c.bytes / sizeof(Vid);
       const uint32_t todo = std::min(entries, tail_deg - emitted);
@@ -161,7 +162,36 @@ public:
     }
   }
 
-  /* Prefetch helpers (headers only; tails are touched on demand) */
+  /* ===== Back-compat: neighbors() view used by older tests =====
+     Returns inline span and the FIRST tail chunk (if any) as a span.
+     Tests that just "touch a few entries" will work with this.           */
+  struct NeighborView {
+    const Vid* inline_ptr{nullptr};
+    uint32_t   inline_len{0};
+    const Vid* tail_ptr{nullptr};
+    uint32_t   tail_len{0}; // length of the first tail chunk only
+  };
+
+  inline NeighborView neighbors(uint64_t u, DerefScope& scope) const {
+    const auto &vh = const_deref_vertex(scope, u);
+    NeighborView nv;
+    nv.inline_ptr = vh.inline_small;
+    nv.inline_len = vh.inline_len;
+
+    const uint32_t tail_deg =
+        (vh.degree > vh.inline_len) ? (vh.degree - vh.inline_len) : 0;
+    if (tail_deg > 0 && !vh.tail_chunks.empty()) {
+      const auto &c0 = vh.tail_chunks[0];
+      const void* raw = c0.ptr.deref(scope);
+      const auto* base = static_cast<const uint8_t*>(raw);
+      nv.tail_ptr = reinterpret_cast<const Vid*>(base);
+      const uint32_t entries = c0.bytes / sizeof(Vid);
+      nv.tail_len = std::min(entries, tail_deg);
+    }
+    return nv;
+  }
+
+  /* Prefetch helpers (headers only; tails on demand) */
   inline void prefetch_headers_span(uint64_t start, uint32_t num) {
     if (num == 0) return;
     verts_.static_prefetch(start, /*step=*/1, num);
@@ -172,8 +202,6 @@ public:
   inline void disable_header_prefetch() {
     verts_.disable_prefetch();
   }
-
-  // Optional: warm the first tail chunk if any (careful with overuse).
   inline void hint_tail_present(uint64_t u) {
     DerefScope s;
     const auto &vh = const_deref_vertex(s, u);
@@ -185,33 +213,30 @@ private:
   const RemotingPolicy& policy_;
   VertexArray    verts_;
 
-  // Map the header mutably
   inline VertexHdr& deref_vertex(const DerefScope& scope, uint64_t i) {
     void* p = verts_.slot(i)->deref_mut(scope);
     return *reinterpret_cast<VertexHdr*>(p);
   }
-  // Map the header read-only
   inline const VertexHdr& const_deref_vertex(const DerefScope& scope, uint64_t i) const {
     auto* h = verts_.slot(i);
     const void* p = h->deref(scope);
     return *reinterpret_cast<const VertexHdr*>(p);
   }
 
-  // Write one tail entry at logical index 'tail_idx' across chunks
+  // map logical tail index -> chunk,offset and write
   inline void write_tail_vid(VertexHdr& vh, const DerefScope& scope,
                              uint32_t tail_idx, Vid v) {
-    // Convert logical entry index to chunk,offset (in entries)
-    uint32_t entries_needed = tail_idx;
+    uint32_t idx = tail_idx;
     for (auto &c : vh.tail_chunks) {
-      const uint32_t entries_in_chunk = c.bytes / sizeof(Vid);
-      if (entries_needed < entries_in_chunk) {
-        auto* base = static_cast<uint8_t*>(c.ptr.deref_mut(scope));
-        reinterpret_cast<Vid*>(base)[entries_needed] = v;
+      const uint32_t entries = c.bytes / sizeof(Vid);
+      if (idx < entries) {
+        void* raw = c.ptr.deref_mut(scope);
+        auto* base = static_cast<uint8_t*>(raw);
+        reinterpret_cast<Vid*>(base)[idx] = v;
         return;
       }
-      entries_needed -= entries_in_chunk;
+      idx -= entries;
     }
-    // Should never happen if we allocated correctly
     assert(false && "tail_idx out of range");
   }
 };
