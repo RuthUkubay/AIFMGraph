@@ -1,3 +1,4 @@
+// aifm/test/test_graph_prefetch.cpp
 extern "C" {
 #include <runtime/runtime.h>
 }
@@ -14,7 +15,8 @@ extern "C" {
 #include <memory>
 #include <queue>
 #include <random>
-#include <thread>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace far_memory;
@@ -25,27 +27,192 @@ constexpr uint64_t kCacheSize    = (128ULL << 20);
 constexpr uint64_t kFarMemSize   = (4ULL  << 30);
 constexpr uint32_t kNumGCThreads = 12;
 
+/* ------------------- Placement policies ------------------- */
+struct AllRemote : RemotingPolicy {
+  uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
+};
+struct Local8 : RemotingPolicy {
+  uint16_t inline_capacity(Vid, uint32_t deg) const override {
+    return deg <= 8 ? deg : 0;
+  }
+};
+
+/* ------------------- Banded-edges generator ------------------- */
+static std::vector<std::pair<Vid,Vid>>
+gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<uint64_t> Uv(0, N - 1);
+  std::uniform_int_distribution<uint32_t> Uw(0, window - 1);
+
+  std::vector<std::pair<Vid,Vid>> edges;
+  edges.reserve(E);
+  for (uint64_t i = 0; i < E; ++i) {
+    Vid u = static_cast<Vid>(Uv(rng));
+    Vid v = static_cast<Vid>((u + Uw(rng)) % N); // keep neighbors near u
+    if (v == u) v = (u + 1) % N;
+    edges.emplace_back(u, v);
+  }
+  return edges;
+}
+
+/* ------------------- BFS variants ------------------- */
+
+// Baseline BFS: plain queue, no prefetch.
+static std::vector<int> bfs_baseline(GraphAdj &G, Vid src) {
+  const uint64_t n = G.num_vertices();
+  std::vector<int> dist(n, -1);
+  if (src >= n) return dist;
+
+  std::queue<Vid> q;
+  dist[src] = 0; q.push(src);
+
+  while (!q.empty()) {
+    Vid u = q.front(); q.pop();
+    DerefScope s;
+    auto nv = G.neighbors(u, s);
+    for (uint32_t i = 0; i < nv.inline_len; ++i) {
+      Vid v = nv.inline_ptr[i];
+      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+    }
+    for (uint32_t i = 0; i < nv.tail_len; ++i) {
+      Vid v = nv.tail_ptr[i];
+      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+    }
+  }
+  return dist;
+}
+
+// Header-prefetch BFS: process vertices in ascending ID per "level"
+// AND enable static prefetch on headers (stride=1).
+static std::vector<int> bfs_header_prefetch(GraphAdj &G, Vid src, uint32_t pf_dist) {
+  G.enable_header_static_prefetch(pf_dist);
+
+  const uint64_t n = G.num_vertices();
+  std::vector<int> dist(n, -1);
+  if (src >= n) return dist;
+
+  std::vector<Vid> curr, next;
+  curr.reserve(1024); next.reserve(1024);
+  dist[src] = 0; curr.push_back(src);
+
+  while (!curr.empty()) {
+    std::sort(curr.begin(), curr.end());
+
+    for (Vid u : curr) {
+      DerefScope s;
+      auto nv = G.neighbors(u, s);
+      for (uint32_t i = 0; i < nv.inline_len; ++i) {
+        Vid v = nv.inline_ptr[i];
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
+      }
+      for (uint32_t i = 0; i < nv.tail_len; ++i) {
+        Vid v = nv.tail_ptr[i];
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
+      }
+    }
+    curr.swap(next);
+    next.clear();
+  }
+  return dist;
+}
+
+// Header + tiny tail warmup (peek first K tail entries to start fetch)
+static std::vector<int> bfs_header_and_tail_warm(GraphAdj &G, Vid src,
+                                                 uint32_t pf_dist,
+                                                 uint32_t peek_k) {
+  G.enable_header_static_prefetch(pf_dist);
+
+  const uint64_t n = G.num_vertices();
+  std::vector<int> dist(n, -1);
+  if (src >= n) return dist;
+
+  std::vector<Vid> curr, next;
+  curr.reserve(1024); next.reserve(1024);
+  dist[src] = 0; curr.push_back(src);
+
+  while (!curr.empty()) {
+    std::sort(curr.begin(), curr.end());
+
+    for (Vid u : curr) {
+      DerefScope s;
+      auto nv = G.neighbors(u, s);
+
+      const uint32_t warm = std::min(peek_k, nv.tail_len);
+      for (uint32_t i = 0; i < warm; ++i) {
+        volatile Vid tmp = nv.tail_ptr[i]; (void)tmp;
+      }
+
+      for (uint32_t i = 0; i < nv.inline_len; ++i) {
+        Vid v = nv.inline_ptr[i];
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
+      }
+      for (uint32_t i = 0; i < nv.tail_len; ++i) {
+        Vid v = nv.tail_ptr[i];
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
+      }
+    }
+    curr.swap(next);
+    next.clear();
+  }
+  return dist;
+}
+
+/* ------------------- Harness ------------------- */
+
+struct RunCfg {
+  const char* name;
+  const char* pol_key;     // "all-remote" or "local-8"
+  const RemotingPolicy& pol;
+  uint32_t pf_distance;    // 0 = no prefetch
+  uint32_t tail_peek;      // 0 = no tail warm
+};
+
+static void time_and_report(GraphAdj& G, Vid src,
+                            uint32_t iters,
+                            uint32_t pf_distance,
+                            uint32_t tail_peek,
+                            double &out_us) {
+  using clk = std::chrono::high_resolution_clock;
+
+  // Warm once with the chosen variant
+  if (pf_distance == 0 && tail_peek == 0) {
+    (void)bfs_baseline(G, src);
+  } else if (tail_peek == 0) {
+    (void)bfs_header_prefetch(G, src, pf_distance);
+  } else {
+    (void)bfs_header_and_tail_warm(G, src, pf_distance, tail_peek);
+  }
+
+  auto t0 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) {
+    if (pf_distance == 0 && tail_peek == 0) {
+      (void)bfs_baseline(G, src);
+    } else if (tail_peek == 0) {
+      (void)bfs_header_prefetch(G, src, pf_distance);
+    } else {
+      (void)bfs_header_and_tail_warm(G, src, pf_distance, tail_peek);
+    }
+  }
+  auto t1 = clk::now();
+  out_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+           / static_cast<double>(iters);
+}
+
 struct ResultRow {
   std::string name;
+  std::string pol_key;
   uint64_t inline_any, remote_any, remote_bytes;
   double nopref_us;     // baseline for this policy in this suite
   double run_us;        // this config's BFS time
   double delta_pct;     // (run_us - nopref_us) / nopref_us * 100
-  std::string pol_key;  // "all-remote" or "local-8"
 };
-
-static const char* pol_key_of(const RemotingPolicy& pol) {
-  if (dynamic_cast<const struct AllRemote*>(&pol)) return "all-remote";
-  return "local-8";
-}
 
 static void run_suite_and_table(FarMemManager* mgr,
                                 uint64_t N, uint64_t E, uint32_t W,
                                 const std::vector<RunCfg>& runs) {
-  using std::cout; using std::endl;
   auto edges = gen_banded_edges(N, E, W);
 
-  // First pass: map policy -> baseline time (pf=0, peek=0)
+  // Map policy -> baseline (no prefetch) time
   std::unordered_map<std::string,double> baseline;
   std::vector<ResultRow> rows;
 
@@ -71,31 +238,32 @@ static void run_suite_and_table(FarMemManager* mgr,
     time_and_report(G, /*src=*/0, /*iters=*/5,
                     cfg.pf_distance, cfg.tail_peek, us);
 
-    // Disable array prefetch on exit to avoid bleeding config into next run
+    // Avoid bleeding static prefetch into the next run
     G.disable_header_prefetch();
 
-    const std::string key = pol_key_of(cfg.pol);
+    // Record baseline when pf=0 and peek=0
     if (cfg.pf_distance == 0 && cfg.tail_peek == 0) {
-      baseline[key] = us;
+      baseline[cfg.pol_key] = us;
     }
 
     ResultRow r;
     r.name = cfg.name;
+    r.pol_key = cfg.pol_key;
     r.inline_any = inline_any;
     r.remote_any = remote_any;
     r.remote_bytes = remote_bytes;
     r.run_us = us;
-    r.pol_key = key;
-    r.nopref_us = baseline.count(key) ? baseline[key] : us; // safe default
+    r.nopref_us = baseline.count(cfg.pol_key) ? baseline[cfg.pol_key] : us;
     r.delta_pct = (r.run_us - r.nopref_us) / r.nopref_us * 100.0;
     rows.push_back(std::move(r));
   }
 
-  // Pretty table: one table for the whole suite
-  cout << "\n| Config | Vertices w/ local | Vertices w/ remote | Remote bytes | No prefetch (µs) | This run (µs) | Δ vs no prefetch |\n";
-  cout << "|---|---:|---:|---:|---:|---:|---:|\n";
+  // Print a clear table for the whole suite.
+  cout << "\n| Config | Policy | Vertices w/ local | Vertices w/ remote | Remote bytes | No prefetch (µs) | This run (µs) | Δ vs no prefetch |\n";
+  cout << "|---|---|---:|---:|---:|---:|---:|---:|\n";
   for (const auto& r : rows) {
     cout << "| " << r.name
+         << " | " << r.pol_key
          << " | " << r.inline_any
          << " | " << r.remote_any
          << " | " << r.remote_bytes
@@ -104,139 +272,6 @@ static void run_suite_and_table(FarMemManager* mgr,
          << " | " << (r.delta_pct >= 0 ? "+" : "") << r.delta_pct << "% |\n";
   }
   cout << "\n";
-}
-
-/* ------------------- Placement policies ------------------- */
-struct AllRemote : RemotingPolicy {
-  uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
-};
-struct Local8 : RemotingPolicy {
-  uint16_t inline_capacity(Vid, uint32_t deg) const override {
-    return deg <= 8 ? deg : 0;
-  }
-};
-
-/* ------------------- Banded edges (spatial locality) ------------------- */
-static std::vector<std::pair<Vid,Vid>>
-gen_banded_edges(uint64_t N, uint64_t E, uint32_t window, uint64_t seed=42) {
-  std::mt19937_64 rng(seed);
-  std::uniform_int_distribution<uint64_t> Uv(0, N - 1);
-  std::uniform_int_distribution<uint32_t> Uw(0, window - 1);
-
-  std::vector<std::pair<Vid,Vid>> edges;
-  edges.reserve(E);
-  for (uint64_t i = 0; i < E; ++i) {
-    Vid u = static_cast<Vid>(Uv(rng));
-    Vid v = static_cast<Vid>((u + Uw(rng)) % N);
-    if (v == u) v = (u + 1) % N;
-    edges.emplace_back(u, v);
-  }
-  return edges;
-}
-
-/* ------------------- BFS variants ------------------- */
-
-// Plain BFS
-static std::vector<int> bfs_baseline(GraphAdj &G, Vid src) {
-  const uint64_t n = G.num_vertices();
-  std::vector<int> dist(n, -1);
-  if (src >= n) return dist;
-
-  std::queue<Vid> q;
-  dist[src] = 0; q.push(src);
-
-  while (!q.empty()) {
-    Vid u = q.front(); q.pop();
-    DerefScope s;
-    auto nv = G.neighbors(u, s);
-    for (uint32_t i = 0; i < nv.inline_len; ++i) {
-      Vid v = nv.inline_ptr[i];
-      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    }
-    for (uint32_t i = 0; i < nv.tail_len; ++i) {
-      Vid v = nv.tail_ptr[i];
-      if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
-    }
-  }
-  return dist;
-}
-
-// Synchronous-warm BFS:
-//  (a) sort current work by vertex id → sequential header touches
-//  (b) warm headers (deref) for the batch
-//  (c) optionally warm first K entries of each tail
-static std::vector<int> bfs_sync_warm(GraphAdj &G, Vid src,
-                                      uint32_t tail_peek_k) {
-  const uint64_t n = G.num_vertices();
-  std::vector<int> dist(n, -1);
-  if (src >= n) return dist;
-
-  std::vector<Vid> curr, next;
-  curr.reserve(1024); next.reserve(1024);
-  dist[src] = 0; curr.push_back(src);
-
-  while (!curr.empty()) {
-    std::sort(curr.begin(), curr.end());
-
-    // warm headers for this batch
-    {
-      std::vector<uint64_t> batch(curr.begin(), curr.end());
-      G.warm_headers_sorted_span(batch.data(), (uint32_t)batch.size());
-    }
-
-    // warm tiny prefix of tails
-    if (tail_peek_k > 0) {
-      for (Vid u : curr) G.warm_tail_prefix(u, tail_peek_k);
-    }
-
-    // expand
-    for (Vid u : curr) {
-      DerefScope s;
-      auto nv = G.neighbors(u, s);
-      for (uint32_t i = 0; i < nv.inline_len; ++i) {
-        Vid v = nv.inline_ptr[i];
-        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
-      }
-      for (uint32_t i = 0; i < nv.tail_len; ++i) {
-        Vid v = nv.tail_ptr[i];
-        if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
-      }
-    }
-    curr.swap(next);
-    next.clear();
-  }
-  return dist;
-}
-
-/* ------------------- Harness ------------------- */
-struct RunCfg {
-  const char* name;
-  const RemotingPolicy& pol;
-  uint32_t tail_peek;   // 0 = no tail warm
-};
-
-static void time_and_report(GraphAdj& G, Vid src,
-                            uint32_t iters,
-                            uint32_t tail_peek,
-                            double &out_us,
-                            bool use_sync_warm) {
-  using clk = std::chrono::high_resolution_clock;
-
-  // Warm once
-  (void)(use_sync_warm ? bfs_sync_warm(G, src, tail_peek)
-                       : bfs_baseline(G, src));
-
-  auto t0 = clk::now();
-  for (uint32_t i = 0; i < iters; ++i) {
-    if (use_sync_warm) {
-      (void)bfs_sync_warm(G, src, tail_peek);
-    } else {
-      (void)bfs_baseline(G, src);
-    }
-  }
-  auto t1 = clk::now();
-  out_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
-           / static_cast<double>(iters);
 }
 
 static void do_work(FarMemManager* mgr) {
@@ -251,18 +286,18 @@ static void do_work(FarMemManager* mgr) {
 
     std::vector<RunCfg> runs = {
       // Baselines (per policy)
-      {"All-remote / no-prefetch", all_remote, 0, 0},
-      {"Local-8 / no-prefetch",    local_8,   0, 0},
+      {"All-remote / no-prefetch", "all-remote", all_remote, 0, 0},
+      {"Local-8 / no-prefetch",    "local-8",    local_8,    0, 0},
 
       // Header-only prefetch
-      {"All-remote / header-pf(d=8)",  all_remote, 8,  0},
-      {"All-remote / header-pf(d=16)", all_remote, 16, 0},
-      {"Local-8 / header-pf(d=8)",     local_8,   8,  0},
-      {"Local-8 / header-pf(d=16)",    local_8,   16, 0},
+      {"All-remote / header-pf(d=8)",  "all-remote", all_remote, 8,  0},
+      {"All-remote / header-pf(d=16)", "all-remote", all_remote, 16, 0},
+      {"Local-8 / header-pf(d=8)",     "local-8",    local_8,    8,  0},
+      {"Local-8 / header-pf(d=16)",    "local-8",    local_8,    16, 0},
 
       // Header + tiny tail look-ahead
-      {"All-remote / header(d=8)+tail(2)", all_remote, 8, 2},
-      {"Local-8 / header(d=8)+tail(2)",    local_8,   8, 2},
+      {"All-remote / header(d=8)+tail(2)", "all-remote", all_remote, 8, 2},
+      {"Local-8 / header(d=8)+tail(2)",    "local-8",    local_8,   8, 2},
     };
 
     run_suite_and_table(mgr, N, E, W, runs);
@@ -276,20 +311,19 @@ static void do_work(FarMemManager* mgr) {
 
     std::vector<RunCfg> runs = {
       // Baseline
-      {"All-remote / no-prefetch", all_remote, 0, 0},
+      {"All-remote / no-prefetch", "all-remote", all_remote, 0, 0},
 
       // Header-only sweep
-      {"All-remote / header-pf(d=8)",   all_remote, 8,  0},
-      {"All-remote / header-pf(d=16)",  all_remote, 16, 0},
-      {"All-remote / header-pf(d=32)",  all_remote, 32, 0},
+      {"All-remote / header-pf(d=8)",   "all-remote", all_remote, 8,  0},
+      {"All-remote / header-pf(d=16)",  "all-remote", all_remote, 16, 0},
+      {"All-remote / header-pf(d=32)",  "all-remote", all_remote, 32, 0},
     };
 
     run_suite_and_table(mgr, N, E, W, runs);
   }
 
-  std::cout << "Done.\n";
+  cout << "Done.\n";
 }
-
 
 static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
@@ -303,3 +337,4 @@ int main(int argc, char* argv[]) {
   if (ret) { std::cerr << "failed to start runtime\n"; return ret; }
   return 0;
 }
+// aifm/test/test_graph_prefetch.cpp
