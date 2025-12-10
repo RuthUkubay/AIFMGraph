@@ -349,59 +349,48 @@ static Row run_case_tailwarm(FarMemManager* mgr,
 }
 
 // ---- Tiny-tail peek sweep (K in {0,1,2,4,8}) with speedup vs baseline ----
-static Row run_case_sorted_frontier(FarMemManager* mgr,
-                                    const std::vector<std::pair<Vid,Vid>>& edges,
-                                    const char* policy_name,
-                                    const RemotingPolicy& pol) {
-  Row r{};
-  r.policy  = policy_name;
-  r.variant = "frontier-sort";
+static void _main(void*) {
+  std::unique_ptr<FarMemManager> manager(
+      FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
 
-  // infer N
-  uint64_t N = 0;
-  for (auto &e : edges) N = std::max<uint64_t>(N, std::max<uint64_t>(e.first, e.second));
-  N += 1;
+  // Workload
+  const uint64_t N = 200000;
+  const uint64_t E = 1200000;
+  const uint32_t W = 64;   // mild spatial locality
+  auto edges = gen_banded_edges(N, E, W);
 
-  GraphAdj G(mgr, N, pol);
-  G.build_from_edges(edges);
+  AllRemote all_remote;
+  Local8    local_8;
 
-  // stats (same as baseline)
-  uint64_t inline_any=0, remote_any=0, remote_bytes=0;
-  for (uint64_t u = 0; u < N; ++u) {
-    DerefScope s;
-    auto h = G.header_info(u, s);
-    if (h.inline_len > 0) inline_any++;
-    if (h.degree > h.inline_len) {
-      remote_any++;
-      remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
-    }
+  cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
+  cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
+
+  // ---- Baselines (no sorting) ----
+  {
+    Row base = run_case(manager.get(), edges, "All-remote", all_remote, /*peek_k=*/0);
+    cout << base.policy << "," << base.variant << "," << base.inline_any << ","
+         << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
   }
-  r.inline_any   = inline_any;
-  r.remote_any   = remote_any;
-  r.remote_bytes = remote_bytes;
+  {
+    Row base = run_case(manager.get(), edges, "Local-8", local_8, /*peek_k=*/0);
+    cout << base.policy << "," << base.variant << "," << base.inline_any << ","
+         << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
+  }
 
-  r.bfs_us = bfs_sorted_frontier_time_us(G, /*src=*/0, /*iters=*/5);
-  return r;
-}
-
-
-
-{
+  // ---- Adaptive frontier sort (only when frontier large & tails heavy) ----
   const uint32_t kSortMinFrontier = 4096; // only sort when frontier is big
-  const uint32_t kTailThreshold   = 64;   // and tails are heavy on average
+  const uint32_t kTailThreshold   = 64;   // and average tail >= 64
 
   // All-remote (adaptive)
   {
-    // rebuild the graph once for timing (same as run_case baseline pattern)
+    // infer N from edges
     uint64_t Nmax = 0;
-    for (auto &e : edges) Nmax = std::max<uint64_t>(Nmax, std::max<uint64_t>(e.first, e.second));
+    for (auto &e : edges)
+      Nmax = std::max<uint64_t>(Nmax, std::max<uint64_t>(e.first, e.second));
     GraphAdj G(manager.get(), Nmax + 1, all_remote);
     G.build_from_edges(edges);
 
-    double us = bfs_frontier_sort_adaptive_time_us(G, /*src=*/0,
-                                                   kSortMinFrontier, kTailThreshold,
-                                                   /*iters=*/5);
-    // stats just for context
+    // stats (for table)
     uint64_t inline_any=0, remote_any=0, remote_bytes=0;
     for (uint64_t u = 0; u < G.num_vertices(); ++u) {
       DerefScope s;
@@ -412,6 +401,11 @@ static Row run_case_sorted_frontier(FarMemManager* mgr,
         remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
       }
     }
+
+    double us = bfs_frontier_sort_adaptive_time_us(G, /*src=*/0,
+                                                   kSortMinFrontier, kTailThreshold,
+                                                   /*iters=*/5);
+
     cout << "All-remote,frontier-sort(adaptive f>=4096 tail>=64),"
          << inline_any << "," << remote_any << "," << remote_bytes << ","
          << us << "\n";
@@ -420,13 +414,11 @@ static Row run_case_sorted_frontier(FarMemManager* mgr,
   // Local-8 (adaptive)
   {
     uint64_t Nmax = 0;
-    for (auto &e : edges) Nmax = std::max<uint64_t>(Nmax, std::max<uint64_t>(e.first, e.second));
+    for (auto &e : edges)
+      Nmax = std::max<uint64_t>(Nmax, std::max<uint64_t>(e.first, e.second));
     GraphAdj G(manager.get(), Nmax + 1, local_8);
     G.build_from_edges(edges);
 
-    double us = bfs_frontier_sort_adaptive_time_us(G, /*src=*/0,
-                                                   kSortMinFrontier, kTailThreshold,
-                                                   /*iters=*/5);
     uint64_t inline_any=0, remote_any=0, remote_bytes=0;
     for (uint64_t u = 0; u < G.num_vertices(); ++u) {
       DerefScope s;
@@ -437,18 +429,28 @@ static Row run_case_sorted_frontier(FarMemManager* mgr,
         remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
       }
     }
+
+    double us = bfs_frontier_sort_adaptive_time_us(G, /*src=*/0,
+                                                   kSortMinFrontier, kTailThreshold,
+                                                   /*iters=*/5);
+
     cout << "Local-8,frontier-sort(adaptive f>=4096 tail>=64),"
          << inline_any << "," << remote_any << "," << remote_bytes << ","
          << us << "\n";
   }
+
+  cout << "Done.\n";
 }
 
-
-
-
 int main(int argc, char* argv[]) {
-  if (argc < 2) { std::cerr << "usage: " << argv[0] << " [cfg_file]\n"; return -EINVAL; }
+  if (argc < 2) {
+    std::cerr << "usage: " << argv[0] << " [cfg_file]\n";
+    return -EINVAL;
+  }
   int ret = runtime_init(argv[1], _main, nullptr);
-  if (ret) { std::cerr << "failed to start runtime\n"; return ret; }
+  if (ret) {
+    std::cerr << "failed to start runtime\n";
+    return ret;
+  }
   return 0;
 }
