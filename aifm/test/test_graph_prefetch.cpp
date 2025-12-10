@@ -25,6 +25,87 @@ constexpr uint64_t kCacheSize    = (128ULL << 20);
 constexpr uint64_t kFarMemSize   = (4ULL  << 30);
 constexpr uint32_t kNumGCThreads = 12;
 
+struct ResultRow {
+  std::string name;
+  uint64_t inline_any, remote_any, remote_bytes;
+  double nopref_us;     // baseline for this policy in this suite
+  double run_us;        // this config's BFS time
+  double delta_pct;     // (run_us - nopref_us) / nopref_us * 100
+  std::string pol_key;  // "all-remote" or "local-8"
+};
+
+static const char* pol_key_of(const RemotingPolicy& pol) {
+  if (dynamic_cast<const struct AllRemote*>(&pol)) return "all-remote";
+  return "local-8";
+}
+
+static void run_suite_and_table(FarMemManager* mgr,
+                                uint64_t N, uint64_t E, uint32_t W,
+                                const std::vector<RunCfg>& runs) {
+  using std::cout; using std::endl;
+  auto edges = gen_banded_edges(N, E, W);
+
+  // First pass: map policy -> baseline time (pf=0, peek=0)
+  std::unordered_map<std::string,double> baseline;
+  std::vector<ResultRow> rows;
+
+  cout << "Graph: |V|=" << N << " |E|=" << E
+       << " (banded window=" << W << ")\n";
+
+  for (const auto& cfg : runs) {
+    GraphAdj G(mgr, N, cfg.pol);
+    G.build_from_edges(edges);
+
+    uint64_t remote_bytes = 0, inline_any = 0, remote_any = 0;
+    for (uint64_t u = 0; u < N; ++u) {
+      DerefScope s;
+      auto h = G.header_info(u, s);
+      if (h.inline_len > 0) inline_any++;
+      if (h.degree > h.inline_len) {
+        remote_any++;
+        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
+      }
+    }
+
+    double us = 0.0;
+    time_and_report(G, /*src=*/0, /*iters=*/5,
+                    cfg.pf_distance, cfg.tail_peek, us);
+
+    // Disable array prefetch on exit to avoid bleeding config into next run
+    G.disable_header_prefetch();
+
+    const std::string key = pol_key_of(cfg.pol);
+    if (cfg.pf_distance == 0 && cfg.tail_peek == 0) {
+      baseline[key] = us;
+    }
+
+    ResultRow r;
+    r.name = cfg.name;
+    r.inline_any = inline_any;
+    r.remote_any = remote_any;
+    r.remote_bytes = remote_bytes;
+    r.run_us = us;
+    r.pol_key = key;
+    r.nopref_us = baseline.count(key) ? baseline[key] : us; // safe default
+    r.delta_pct = (r.run_us - r.nopref_us) / r.nopref_us * 100.0;
+    rows.push_back(std::move(r));
+  }
+
+  // Pretty table: one table for the whole suite
+  cout << "\n| Config | Vertices w/ local | Vertices w/ remote | Remote bytes | No prefetch (µs) | This run (µs) | Δ vs no prefetch |\n";
+  cout << "|---|---:|---:|---:|---:|---:|---:|\n";
+  for (const auto& r : rows) {
+    cout << "| " << r.name
+         << " | " << r.inline_any
+         << " | " << r.remote_any
+         << " | " << r.remote_bytes
+         << " | " << r.nopref_us
+         << " | " << r.run_us
+         << " | " << (r.delta_pct >= 0 ? "+" : "") << r.delta_pct << "% |\n";
+  }
+  cout << "\n";
+}
+
 /* ------------------- Placement policies ------------------- */
 struct AllRemote : RemotingPolicy {
   uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
@@ -159,71 +240,56 @@ static void time_and_report(GraphAdj& G, Vid src,
 }
 
 static void do_work(FarMemManager* mgr) {
-  const uint64_t N = 200000;
-  const uint64_t E = 1200000;
-  const uint32_t W = 64;     // band window
-  const uint32_t iters = 5;
-  auto edges = gen_banded_edges(N, E, W);
-
   AllRemote all_remote;
   Local8    local_8;
 
-  // Runs: baseline vs synchronous warm (peek K tail entries)
-  RunCfg runs[] = {
-    {"All-remote / baseline",            all_remote, 0},
-    {"All-remote / sync-warm + tail(4)", all_remote, 4},
+  // -------- Bundle A: higher degree + tighter locality --------
+  {
+    const uint64_t N = 200000;
+    const uint64_t E = N * 16;   // avg degree ~16
+    const uint32_t W = 16;       // tighter band
 
-    {"Local-8 / baseline",               local_8,    0},
-    {"Local-8 / sync-warm + tail(4)",    local_8,    4},
-  };
+    std::vector<RunCfg> runs = {
+      // Baselines (per policy)
+      {"All-remote / no-prefetch", all_remote, 0, 0},
+      {"Local-8 / no-prefetch",    local_8,   0, 0},
 
-  cout << "Graph: |V|=" << N << " |E|=" << E
-       << " (banded window=" << W << ")\n";
+      // Header-only prefetch
+      {"All-remote / header-pf(d=8)",  all_remote, 8,  0},
+      {"All-remote / header-pf(d=16)", all_remote, 16, 0},
+      {"Local-8 / header-pf(d=8)",     local_8,   8,  0},
+      {"Local-8 / header-pf(d=16)",    local_8,   16, 0},
 
-  for (auto &cfg : runs) {
-    GraphAdj G(mgr, N, cfg.pol);
-    G.build_from_edges(edges);
+      // Header + tiny tail look-ahead
+      {"All-remote / header(d=8)+tail(2)", all_remote, 8, 2},
+      {"Local-8 / header(d=8)+tail(2)",    local_8,   8, 2},
+    };
 
-    // layout stats
-    uint64_t remote_bytes = 0, inline_any = 0, remote_any = 0;
-    for (uint64_t u = 0; u < N; ++u) {
-      DerefScope s;
-      auto h = G.header_info(u, s);
-      if (h.inline_len > 0) inline_any++;
-      if (h.degree > h.inline_len) {
-        remote_any++;
-        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
-      }
-    }
-
-    double base_us = 0.0, warm_us = 0.0;
-
-    time_and_report(G, /*src=*/0, iters,
-                    /*tail_peek=*/cfg.tail_peek, base_us,
-                    /*use_sync_warm=*/false);
-
-    // small pause to let GC settle before next timed path on the same G
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    time_and_report(G, /*src=*/0, iters,
-                    /*tail_peek=*/cfg.tail_peek, warm_us,
-                    /*use_sync_warm=*/true);
-
-    cout << cfg.name
-         << " | inline_any=" << inline_any
-         << " remote_any=" << remote_any
-         << " remote_bytes=" << remote_bytes
-         << " | BFS baseline_us=" << base_us
-         << " | sync_warm_us=" << warm_us
-         << " | delta=" << (base_us - warm_us)
-         << " (" << (100.0 * (base_us - warm_us) / base_us) << "% faster)"
-         << "\n";
-
-    // extra pause before destroying G to be extra safe on devices
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    run_suite_and_table(mgr, N, E, W, runs);
   }
-  cout << "Done.\n";
+
+  // -------- Bundle B: all-remote, header-only sweep --------
+  {
+    const uint64_t N = 200000;
+    const uint64_t E = N * 12;   // avg degree ~12
+    const uint32_t W = 32;       // moderate locality
+
+    std::vector<RunCfg> runs = {
+      // Baseline
+      {"All-remote / no-prefetch", all_remote, 0, 0},
+
+      // Header-only sweep
+      {"All-remote / header-pf(d=8)",   all_remote, 8,  0},
+      {"All-remote / header-pf(d=16)",  all_remote, 16, 0},
+      {"All-remote / header-pf(d=32)",  all_remote, 32, 0},
+    };
+
+    run_suite_and_table(mgr, N, E, W, runs);
+  }
+
+  std::cout << "Done.\n";
 }
+
 
 static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
