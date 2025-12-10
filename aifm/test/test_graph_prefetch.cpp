@@ -167,6 +167,40 @@ static double bfs_time_us_tailwarm(GraphAdj &G, Vid src,
          / static_cast<double>(iters);
 }
 
+/* BFS that sorts each frontier by vertex ID before expanding (improves locality). */
+static double bfs_sorted_frontier_time_us(GraphAdj &G, Vid src, uint32_t iters) {
+  using clk = std::chrono::high_resolution_clock;
+  const uint64_t n = G.num_vertices();
+  if (src >= n) return 0.0;
+
+  auto run_once = [&](){
+    std::vector<int> dist(n, -1);
+    std::vector<Vid> curr, next;
+    curr.reserve(1024); next.reserve(1024);
+    dist[src] = 0; curr.push_back(src);
+
+    while (!curr.empty()) {
+      // Key idea: make header/tail touches nearly sequential
+      std::sort(curr.begin(), curr.end());
+
+      for (Vid u : curr) {
+        DerefScope s;
+        G.for_each_neighbor(u, s, [&](Vid v){
+          if (dist[v] == -1) { dist[v] = dist[u] + 1; next.push_back(v); }
+        });
+      }
+      curr.swap(next);
+      next.clear();
+    }
+  };
+
+  run_once(); // warm
+  auto t0 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) run_once();
+  auto t1 = clk::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+         / static_cast<double>(iters);
+}
 
 
 
@@ -258,65 +292,87 @@ static Row run_case_tailwarm(FarMemManager* mgr,
 }
 
 // ---- Tiny-tail peek sweep (K in {0,1,2,4,8}) with speedup vs baseline ----
-static void run_peek_table(FarMemManager* mgr,
-                           const std::vector<std::pair<Vid,Vid>>& edges,
-                           const char* policy_name,
-                           const RemotingPolicy& pol,
-                           const std::vector<uint32_t>& peeks) {
-  // Build one graph (shared across runs for apples-to-apples)
-  // Note: we rebuild inside run_case() for safety, but we also need stats only once for header.
-  // We'll just print stats from the baseline row.
-  Row baseline = run_case(mgr, edges, policy_name, pol, /*peek_k=*/0);
-  double base_us = baseline.bfs_us;
+static Row run_case_sorted_frontier(FarMemManager* mgr,
+                                    const std::vector<std::pair<Vid,Vid>>& edges,
+                                    const char* policy_name,
+                                    const RemotingPolicy& pol) {
+  Row r{};
+  r.policy  = policy_name;
+  r.variant = "frontier-sort";
 
-  cout << policy_name << "," << "baseline" << ","
-       << baseline.inline_any << ","
-       << baseline.remote_any << ","
-       << baseline.remote_bytes << ","
-       << baseline.bfs_us << ","
-       << "—" << "\n";
+  // infer N
+  uint64_t N = 0;
+  for (auto &e : edges) N = std::max<uint64_t>(N, std::max<uint64_t>(e.first, e.second));
+  N += 1;
 
-  // Now sweep peeks (skip 0 because we printed baseline already)
-  for (auto k : peeks) {
-    if (k == 0) continue;
-    Row r = run_case(mgr, edges, policy_name, pol, /*peek_k=*/k);
-    double speedup = (base_us - r.bfs_us) / base_us * 100.0; // + = faster
-    // reuse the baseline's layout stats to keep the table compact (they don't change with peek)
-    cout << policy_name << "," << ("tailpeek(" + std::to_string(k) + ")") << ","
-         << baseline.inline_any << ","
-         << baseline.remote_any << ","
-         << baseline.remote_bytes << ","
-         << r.bfs_us << ","
-         << (speedup >= 0 ? "+" : "") << speedup << "%\n";
+  GraphAdj G(mgr, N, pol);
+  G.build_from_edges(edges);
+
+  // stats (same as baseline)
+  uint64_t inline_any=0, remote_any=0, remote_bytes=0;
+  for (uint64_t u = 0; u < N; ++u) {
+    DerefScope s;
+    auto h = G.header_info(u, s);
+    if (h.inline_len > 0) inline_any++;
+    if (h.degree > h.inline_len) {
+      remote_any++;
+      remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
+    }
   }
+  r.inline_any   = inline_any;
+  r.remote_any   = remote_any;
+  r.remote_bytes = remote_bytes;
+
+  r.bfs_us = bfs_sorted_frontier_time_us(G, /*src=*/0, /*iters=*/5);
+  return r;
 }
+
 
 
 static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
 
-  // Workload: same as you’ve been using
   const uint64_t N = 200000;
   const uint64_t E = 1200000;
-  const uint32_t W = 64;   // mild spatial locality
+  const uint32_t W = 64;
   auto edges = gen_banded_edges(N, E, W);
 
   AllRemote all_remote;
   Local8    local_8;
 
   cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
-  cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,"
-          "BFS per-iter (µs),Speedup vs policy-baseline\n";
+  cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs),Speedup vs policy-baseline\n";
 
-  // Peek sizes to sweep. Keep tiny to avoid the overhead you saw.
-  std::vector<uint32_t> peeks = {0, 1, 2, 4, 8};
+  // --- All-remote ---
+  Row baseA = run_case(manager.get(), edges, "All-remote", all_remote, /*peek_k=*/0);
+  cout << baseA.policy << "," << baseA.variant << "," << baseA.inline_any << ","
+       << baseA.remote_any << "," << baseA.remote_bytes << "," << baseA.bfs_us << ",—\n";
 
-  run_peek_table(manager.get(), edges, "All-remote", all_remote, peeks);
-  run_peek_table(manager.get(), edges, "Local-8",    local_8,    peeks);
+  Row sortA = run_case_sorted_frontier(manager.get(), edges, "All-remote", all_remote);
+  {
+    double speed = (baseA.bfs_us - sortA.bfs_us) / baseA.bfs_us * 100.0;
+    cout << sortA.policy << "," << sortA.variant << ","
+         << baseA.inline_any << "," << baseA.remote_any << "," << baseA.remote_bytes << ","
+         << sortA.bfs_us << "," << (speed >= 0 ? "+" : "") << speed << "%\n";
+  }
+
+  // --- Local-8 ---
+  Row baseL = run_case(manager.get(), edges, "Local-8", local_8, /*peek_k=*/0);
+  cout << baseL.policy << "," << baseL.variant << "," << baseL.inline_any << ","
+       << baseL.remote_any << "," << baseL.remote_bytes << "," << baseL.bfs_us << ",—\n";
+
+  Row sortL = run_case_sorted_frontier(manager.get(), edges, "Local-8", local_8);
+  {
+    double speed = (baseL.bfs_us - sortL.bfs_us) / baseL.bfs_us * 100.0;
+    cout << sortL.policy << "," << sortL.variant << ","
+         << baseL.inline_any << "," << baseL.remote_any << "," << baseL.remote_bytes << ","
+         << sortL.bfs_us << "," << (speed >= 0 ? "+" : "") << speed << "%\n";
+  }
 
   cout << "Done.\n";
 }
+
 
 
 int main(int argc, char* argv[]) {
