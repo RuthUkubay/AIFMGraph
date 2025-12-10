@@ -115,6 +115,50 @@ static double bfs_tailpeek_time_us(GraphAdj &G, Vid src, uint32_t peek_k, uint32
          / static_cast<double>(iters);
 }
 
+// Gated tail warm-up: if a vertex has a large enough remote tail,
+// call hint_tail_present(u) first (to start the fetch), then iterate neighbors.
+// Tail threshold keeps it cheap and focused on vertices where it matters.
+static double bfs_time_us_tailwarm(GraphAdj &G, Vid src,
+                                   uint32_t iters,
+                                   uint32_t tail_threshold) {
+  using clk = std::chrono::high_resolution_clock;
+  const uint64_t n = G.num_vertices();
+  if (src >= n) return 0.0;
+
+  auto run_once = [&](){
+    std::vector<int> dist(n, -1);
+    std::queue<Vid> q;
+    dist[src] = 0; q.push(src);
+
+    while (!q.empty()) {
+      Vid u = q.front(); q.pop();
+      DerefScope s;
+
+      // Check tail size from header; if big enough, warm it.
+      auto h = G.header_info(u, s);
+      const uint32_t tail_len = (h.degree > h.inline_len) ? (h.degree - h.inline_len) : 0;
+      if (tail_len >= tail_threshold) {
+        // This only hints the tail; it doesn't read entries or allocate extra buffers.
+        G.hint_tail_present(u);
+      }
+
+      // Now do the normal walk (inline first, tail second).
+      G.for_each_neighbor(u, s, [&](Vid v){
+        if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+      });
+    }
+  };
+
+  // warm
+  run_once();
+  auto t0 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) run_once();
+  auto t1 = clk::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+         / static_cast<double>(iters);
+}
+
+
 /* One run row */
 struct Row {
   const char* policy;
@@ -169,6 +213,48 @@ static Row run_case(FarMemManager* mgr,
 
   return r;
 }
+static Row run_case_tailwarm(FarMemManager* mgr,
+                             const std::vector<std::pair<Vid,Vid>>& edges,
+                             const char* policy_name,
+                             const RemotingPolicy& pol,
+                             uint32_t tail_threshold /* e.g., 16 */) {
+  Row r{};
+  r.policy   = policy_name;
+  r.prefetch = tail_threshold ? "tailwarm(th=16)" : "none";
+
+  {
+    GraphAdj G(mgr, /*N=*/0, pol); // dummy scope – ensures no premature alloc
+  }
+
+  {
+    // Build with the actual vertex count inferred from edges
+    GraphAdj G(mgr, /*N=*/edges.empty()?0:(
+      [&](){ Vid maxv=0; for (auto &e : edges) { if (e.first>maxv) maxv=e.first; if (e.second>maxv) maxv=e.second; }
+             return (uint64_t)maxv + 1; }()),
+      pol);
+
+    G.build_from_edges(edges);
+
+    const uint64_t N = G.num_vertices();
+    uint64_t inline_any=0, remote_any=0, remote_bytes=0;
+    for (uint64_t u = 0; u < N; ++u) {
+      DerefScope s;
+      auto h = G.header_info(u, s);
+      if (h.inline_len > 0) inline_any++;
+      if (h.degree > h.inline_len) {
+        remote_any++;
+        remote_bytes += (h.degree - h.inline_len) * sizeof(Vid);
+      }
+    }
+    r.inline_any   = inline_any;
+    r.remote_any   = remote_any;
+    r.remote_bytes = remote_bytes;
+
+    r.bfs_us = bfs_time_us_tailwarm(G, /*src=*/0, /*iters=*/5, tail_threshold);
+    // No static prefetcher to disable; no speculative reads; safe and simple.
+  }
+  return r;
+}
 
 static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
@@ -183,29 +269,29 @@ static void _main(void*) {
   AllRemote all_remote;
   Local8    local_8;
 
-  cout << "Graph: |V|=" << N << " |E|=" << E << "\n";
-  cout << "Policy,Variant,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
+    cout << "Graph: |V|=" << N << " |E|=" << E << " (banded window=" << W << ")\n";
+    cout << "Policy,Prefetch,Vertices w/ local neighbors,Vertices w/ remote,Remote bytes,BFS per-iter (µs)\n";
 
-  // All-remote: baseline vs tiny tail peek (K=2)
+  // All-remote: baseline vs gated tail warm (th=16)
   {
-    Row a = run_case(manager.get(), edges, "All-remote", all_remote, /*peek_k=*/0);
-    cout << a.policy << "," << a.variant << "," << a.inline_any << "," << a.remote_any
-         << "," << a.remote_bytes << "," << a.bfs_us << "\n";
+    Row base = run_case(manager.get(), edges, "All-remote", all_remote, /*header_pf=*/0);
+    cout << base.policy << "," << base.prefetch << "," << base.inline_any << ","
+         << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
 
-    Row b = run_case(manager.get(), edges, "All-remote", all_remote, /*peek_k=*/2);
-    cout << b.policy << "," << b.variant << "," << b.inline_any << "," << b.remote_any
-         << "," << b.remote_bytes << "," << b.bfs_us << "\n";
+    Row warm = run_case_tailwarm(manager.get(), edges, "All-remote", all_remote, /*tail_threshold=*/16);
+    cout << warm.policy << "," << warm.prefetch << "," << warm.inline_any << ","
+         << warm.remote_any << "," << warm.remote_bytes << "," << warm.bfs_us << "\n";
   }
 
-  // Local-8: baseline vs tiny tail peek (K=2)
+  // Local-8: baseline vs gated tail warm (th=16)
   {
-    Row a = run_case(manager.get(), edges, "Local-8", local_8, /*peek_k=*/0);
-    cout << a.policy << "," << a.variant << "," << a.inline_any << "," << a.remote_any
-         << "," << a.remote_bytes << "," << a.bfs_us << "\n";
+    Row base = run_case(manager.get(), edges, "Local-8", local_8, /*header_pf=*/0);
+    cout << base.policy << "," << base.prefetch << "," << base.inline_any << ","
+         << base.remote_any << "," << base.remote_bytes << "," << base.bfs_us << "\n";
 
-    Row b = run_case(manager.get(), edges, "Local-8", local_8, /*peek_k=*/2);
-    cout << b.policy << "," << b.variant << "," << b.inline_any << "," << b.remote_any
-         << "," << b.remote_bytes << "," << b.bfs_us << "\n";
+    Row warm = run_case_tailwarm(manager.get(), edges, "Local-8", local_8, /*tail_threshold=*/16);
+    cout << warm.policy << "," << warm.prefetch << "," << warm.inline_any << ","
+         << warm.remote_any << "," << warm.remote_bytes << "," << warm.bfs_us << "\n";
   }
 
   cout << "Done.\n";
