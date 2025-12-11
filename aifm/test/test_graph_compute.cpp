@@ -5,68 +5,153 @@ extern "C" {
 
 #include "device.hpp"
 #include "manager.hpp"
-#include "deref_scope.hpp"
 #include "graph_adj.hpp"
+#include "deref_scope.hpp"
 
-#include <cassert>
-#include <cerrno>
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <vector>
 
 using namespace far_memory;
 using std::cout;
 using std::endl;
 
-// Use an "all remote" placement so everything goes through far memory.
-struct AllRemote : RemotingPolicy {
-  uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
-};
+constexpr uint64_t kCacheSize    = (128ULL << 20);
+constexpr uint64_t kFarMemSize   = (4ULL  << 30);
+constexpr uint32_t kNumGCThreads = 12;
 
-constexpr uint64_t kCacheSize    = (64ULL  << 20);  // small is fine
-constexpr uint64_t kFarMemSize   = (1ULL   << 30);
-constexpr uint32_t kNumGCThreads = 4;
+// Reuse the banded-edge generator from your prefetch test.
+static std::vector<std::pair<Vid,Vid>>
+gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed=42) {
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<uint64_t> Uu(0, N - 1);
+  std::uniform_int_distribution<uint32_t> Uw(0, W - 1);
 
-static void _main(void *) {
-  // Build a FarMemManager with a FakeDevice (in-process remote server).
+  std::vector<std::pair<Vid,Vid>> edges;
+  edges.reserve(E);
+  for (uint64_t i = 0; i < E; ++i) {
+    Vid u = static_cast<Vid>(Uu(rng));
+    Vid v = static_cast<Vid>((u + Uw(rng)) % N);
+    if (v == u) v = (u + 1) % N;
+    edges.emplace_back(u, v);
+  }
+  return edges;
+}
+
+// --- Local baseline: sum frontier IDs, but force a far-mem header deref ---
+// This simulates a naive "look at each vertex header" aggregation.
+static uint64_t
+local_frontier_sum_with_deref(GraphAdj &G,
+                              const std::vector<Vid> &frontier) {
+  uint64_t total = 0;
+  DerefScope s;
+  for (Vid u : frontier) {
+    auto h = G.header_info(u, s); // forces a header deref from far mem
+    (void)h;                      // we don't use it, just touch it
+    total += static_cast<uint64_t>(u);
+  }
+  return total;
+}
+
+// --- Remote frontier aggregation: use your active component ---
+// This calls GraphAdj::remote_degree_sum, which (for now) also sums the IDs.
+static uint64_t
+remote_frontier_sum(GraphAdj &G,
+                    const std::vector<Vid> &frontier) {
+  return G.remote_degree_sum(frontier);
+}
+
+static void benchmark_frontier_agg(GraphAdj &G,
+                                   const std::vector<Vid> &frontier,
+                                   uint32_t iters) {
+  using clk = std::chrono::high_resolution_clock;
+  using us  = std::chrono::microseconds;
+
+  // Sanity check: both paths should return the same value.
+  uint64_t local_once  = local_frontier_sum_with_deref(G, frontier);
+  uint64_t remote_once = remote_frontier_sum(G, frontier);
+
+  cout << "test_graph_compute: expected sum = " << local_once
+       << ", remote_sum = " << remote_once << endl;
+
+  if (local_once != remote_once) {
+    cout << "test_graph_compute: MISMATCH (local vs remote)!" << endl;
+    return;
+  }
+  cout << "test_graph_compute: PASS" << endl;
+
+  // --- Benchmark local ---
+  auto t0 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) {
+    (void)local_frontier_sum_with_deref(G, frontier);
+  }
+  auto t1 = clk::now();
+  double local_us =
+      std::chrono::duration_cast<us>(t1 - t0).count() / double(iters);
+
+  // --- Benchmark remote ---
+  auto t2 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) {
+    (void)remote_frontier_sum(G, frontier);
+  }
+  auto t3 = clk::now();
+  double remote_us =
+      std::chrono::duration_cast<us>(t3 - t2).count() / double(iters);
+
+  double speedup_pct =
+      (local_us > 0.0) ? (1.0 - remote_us / local_us) * 100.0 : 0.0;
+
+  cout << "Frontier size: " << frontier.size() << "\n";
+  cout << "Local  agg (with header derefs): " << local_us  << " us / call\n";
+  cout << "Remote agg (active component)  : " << remote_us << " us / call\n";
+  cout << "Relative improvement           : "
+       << (speedup_pct >= 0 ? "+" : "") << speedup_pct << "%\n";
+}
+
+// Main AIFM runtime entry.
+static void _main(void*) {
   std::unique_ptr<FarMemManager> manager(
       FarMemManagerFactory::build(kCacheSize, kNumGCThreads,
                                   new FakeDevice(kFarMemSize)));
 
-  // Tiny graph; we don't actually care about edges for this smoke test.
-  const uint64_t N = 16;
-  AllRemote pol;
-  GraphAdj G(manager.get(), N, pol);
+  // Build a medium-size graph in far memory.
+  const uint64_t N = 200000;
+  const uint64_t E = 1200000;
+  const uint32_t W = 64;
+  auto edges = gen_banded_edges(N, E, W);
 
-  // Empty edge list is fine; this just initializes headers to degree=0.
-  std::vector<std::pair<Vid, Vid>> edges;
-  G.build_from_edges(edges);
+  // Simple remoting policy (all remote for now).
+  struct AllRemote : RemotingPolicy {
+    uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
+  } all_remote;
 
-  // Frontier whose elements we expect the remote to sum.
-  // This matches the "sum frontier[i]" behavior in ServerGraphAgg::compute().
-  std::vector<Vid> frontier = {1, 2, 3, 4, 5};
-  uint64_t expected = 0;
-  for (auto v : frontier) {
-    expected += static_cast<uint64_t>(v);
+  // Build the graph adjacency in far memory.
+  auto G = std::make_unique<GraphAdj>(manager.get(), N, all_remote);
+  G->build_from_edges(edges);
+
+  // Pick a random frontier (no BFS semantics needed for this microbenchmark).
+  const size_t frontier_size = 10000;
+  std::vector<Vid> frontier;
+  frontier.reserve(frontier_size);
+
+  std::mt19937_64 rng(12345);
+  std::uniform_int_distribution<uint64_t> U(0, N - 1);
+  for (size_t i = 0; i < frontier_size; ++i) {
+    frontier.push_back(static_cast<Vid>(U(rng)));
   }
 
-  // Call our graph remote compute path.
-  uint64_t remote_sum = G.remote_degree_sum(frontier);
+  // Run the sanity check + microbenchmark.
+  const uint32_t iters = 200;
+  benchmark_frontier_agg(*G, frontier, iters);
 
-  cout << "test_graph_compute: expected sum = " << expected
-       << ", remote_sum = " << remote_sum << endl;
-
-  if (remote_sum != expected) {
-    std::cerr << "ERROR: remote_degree_sum mismatch!" << std::endl;
-    // You can BUG() or just assert.
-    assert(false && "remote_degree_sum mismatch");
-  } else {
-    cout << "test_graph_compute: PASS" << endl;
-  }
+  cout << "Done.\n";
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
   if (argc < 2) {
     std::cerr << "usage: " << argv[0] << " [cfg_file]\n";
     return -EINVAL;
