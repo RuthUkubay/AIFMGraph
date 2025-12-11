@@ -89,27 +89,27 @@ public:
 /* Graph: adjacency lists over AIFM */
 class GraphAdj {
 public:
-  // inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices,
-  //                 const RemotingPolicy& policy)
-  //     : mgr_(mgr), policy_(policy), verts_(mgr, n_vertices) {}
-
-
-
   inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices,
                   const RemotingPolicy& policy)
-      : mgr_(mgr), policy_(policy), verts_(mgr, n_vertices) {
-    // Initialize the graph active component on the remote memory server.
-    GraphAggParams params;
-    params.num_vertices = n_vertices;
+      : mgr_(mgr), policy_(policy), verts_(mgr, n_vertices) {}
 
-    FarMemDevice *dev = mgr_->get_device();
-    assert(dev != nullptr);
 
-    dev->construct(/*ds_type=*/kGraphAggDSType,
-                   /*ds_id=*/kGraphDSID,
-                   /*param_len=*/sizeof(params),
-                   /*params=*/reinterpret_cast<uint8_t*>(&params));
-  }
+
+  // inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices,
+  //                 const RemotingPolicy& policy)
+  //     : mgr_(mgr), policy_(policy), verts_(mgr, n_vertices) {
+  //   // Initialize the graph active component on the remote memory server.
+  //   GraphAggParams params;
+  //   params.num_vertices = n_vertices;
+
+  //   FarMemDevice *dev = mgr_->get_device();
+  //   assert(dev != nullptr);
+
+  //   dev->construct(/*ds_type=*/kGraphAggDSType,
+  //                  /*ds_id=*/kGraphDSID,
+  //                  /*param_len=*/sizeof(params),
+  //                  /*params=*/reinterpret_cast<uint8_t*>(&params));
+  // }
 
 
 
@@ -175,50 +175,64 @@ public:
   verts_.static_prefetch(/*start=*/start, /*step=*/1, /*num=*/num);
 }
 
-  // Compute sum of degrees of a frontier via remote compute.
-  uint64_t remote_degree_sum(const std::vector<Vid>& frontier) const {
+  // Compute sum of degrees (or vertex IDs for now) for a frontier via
+  // a remote active component.
+  //
+  // NOTE: This lazily constructs the remote graph aggregation component
+  //       the first time it’s called, and reuses it thereafter. That way
+  //       tests that *don’t* use remote compute (like test_graph_prefetch)
+  //       never touch DSID kGraphDSID and don’t trip Server::construct().
+  inline uint64_t remote_degree_sum(const std::vector<Vid>& frontier) const {
     const uint32_t n = static_cast<uint32_t>(frontier.size());
-    if (n == 0) {
-      return 0;
+    if (n == 0) return 0;
+
+    // --- One-time registration of the graph active component on this device ---
+    {
+      static bool registered = false;
+      if (!registered) {
+        FarMemDevice* dev = mgr_->get_device();
+
+        // Must match the struct in server_graph.hpp
+        struct __attribute__((packed)) GraphAggParams {
+          uint64_t num_vertices;
+        } params;
+
+        params.num_vertices = verts_.size();
+
+        dev->construct(/*ds_type=*/kGraphAggDSType,
+                       /*ds_id=*/kGraphDSID,
+                       /*param_len=*/sizeof(params),
+                       /*params=*/reinterpret_cast<uint8_t*>(&params));
+        registered = true;
+      }
     }
 
-    // Build compute() input: [GraphDegreeSumReqHdr][frontier_len * Vid]
-    const size_t in_bytes =
-        sizeof(GraphDegreeSumReqHdr) + static_cast<size_t>(n) * sizeof(Vid);
+    // --- Build input buffer: [frontier_len][frontier...] ---
+    std::vector<uint8_t> in;
+    in.resize(sizeof(uint32_t) + n * sizeof(Vid));
+    uint8_t* p = in.data();
+    std::memcpy(p, &n, sizeof(uint32_t));
+    p += sizeof(uint32_t);
+    std::memcpy(p, frontier.data(), n * sizeof(Vid));
 
-    // compute() length field is uint16_t, so enforce this bound.
-    assert(in_bytes <= std::numeric_limits<uint16_t>::max());
-
-    std::vector<uint8_t> in(in_bytes);
-
-    // Fill header
-    auto *hdr = reinterpret_cast<GraphDegreeSumReqHdr*>(in.data());
-    hdr->frontier_len = n;
-
-    // Fill vertex IDs right after the header
-    auto *ids = reinterpret_cast<Vid*>(
-        in.data() + sizeof(GraphDegreeSumReqHdr));
-    std::memcpy(ids, frontier.data(), n * sizeof(Vid));
-
-    uint16_t in_len  = static_cast<uint16_t>(in_bytes);
+    uint16_t in_len  = static_cast<uint16_t>(in.size());
     uint16_t out_len = 0;
-    uint8_t  out_buf[sizeof(uint64_t)] = {0};
+    uint8_t out_buf[sizeof(uint64_t)] = {0};
 
-    FarMemDevice *dev = mgr_->get_device();
-    assert(dev != nullptr);
-
+    FarMemDevice* dev = mgr_->get_device();
     dev->compute(/*ds_id=*/kGraphDSID,
-                 /*opcode=*/static_cast<uint8_t>(kGraphOpDegreeSum),
+                 /*opcode=*/kGraphOpDegreeSum,
                  /*input_len=*/in_len,
                  /*input_buf=*/in.data(),
                  /*output_len=*/&out_len,
                  /*output_buf=*/out_buf);
 
     assert(out_len == sizeof(uint64_t));
-    uint64_t total_deg = 0;
-    std::memcpy(&total_deg, out_buf, sizeof(total_deg));
-    return total_deg;
+    uint64_t total = 0;
+    std::memcpy(&total, out_buf, sizeof(uint64_t));
+    return total;
   }
+
 
 
 
