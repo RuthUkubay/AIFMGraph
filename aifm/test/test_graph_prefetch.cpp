@@ -204,7 +204,7 @@ static void _main(void*) {
          << (sp2 >= 0 ? "+" : "") << sp2 << "%\n";
   }
 
-  cout << "Done.\n";
+  cout << "Done. passed. \n";
 }
 
 int main(int argc, char* argv[]) {

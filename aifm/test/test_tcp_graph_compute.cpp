@@ -1,9 +1,10 @@
-// aifm/test/test_graph_compute.cpp
+// aifm/test/test_graph_compute_tcp.cpp
 extern "C" {
 #include <runtime/runtime.h>
 }
 
 #include "device.hpp"
+#include "helpers.hpp"
 #include "manager.hpp"
 #include "graph_adj.hpp"
 #include "deref_scope.hpp"
@@ -11,18 +12,21 @@ extern "C" {
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <random>
 #include <vector>
+#include <string>
 
 using namespace far_memory;
 using std::cout;
 using std::endl;
 
-constexpr uint64_t kCacheSize    = (128ULL << 20);
-constexpr uint64_t kFarMemSize   = (4ULL  << 30);
-constexpr uint32_t kNumGCThreads = 12;
+constexpr static uint64_t kCacheSize    = (128ULL << 20);
+constexpr static uint64_t kFarMemSize   = (4ULL  << 30);
+constexpr static uint32_t kNumGCThreads = 12;
+constexpr static uint32_t kNumConnections = 300;
 
 // Reuse the banded-edge generator from your prefetch test.
 static std::vector<std::pair<Vid,Vid>>
@@ -112,11 +116,18 @@ static void benchmark_frontier_agg(GraphAdj &G,
        << (speedup_pct >= 0 ? "+" : "") << speedup_pct << "%\n";
 }
 
+int argc;
+
 // Main AIFM runtime entry.
-static void _main(void*) {
+static void _main(void *arg) {
+  char **argv = static_cast<char **>(arg);
+  std::string ip_addr_port(argv[1]);
+  auto raddr = helpers::str_to_netaddr(ip_addr_port);
+
   std::unique_ptr<FarMemManager> manager(
-      FarMemManagerFactory::build(kCacheSize, kNumGCThreads,
-                                  new FakeDevice(kFarMemSize)));
+      FarMemManagerFactory::build(
+          kCacheSize, kNumGCThreads,
+          new TCPDevice(raddr, kNumConnections, kFarMemSize)));
 
   // Build a medium-size graph in far memory.
   const uint64_t N = 200000;
@@ -151,10 +162,23 @@ static void _main(void*) {
   cout << "Done.\n";
 }
 
-int main(int argc, char* argv[]) {
-  if (argc < 2) {
-    std::cerr << "usage: " << argv[0] << " [cfg_file]\n";
+int main(int _argc, char* argv[]) {
+  if (_argc < 3) {
+    std::cerr << "usage: " << argv[0] << " [cfg_file] [ip_addr:port]\n";
     return -EINVAL;
   }
-  return runtime_init(argv[1], _main, nullptr);
+
+  char conf_path[strlen(argv[1]) + 1];
+  strcpy(conf_path, argv[1]);
+  for (int i = 2; i < _argc; i++) {
+    argv[i - 1] = argv[i];
+  }
+  argc = _argc - 1;
+
+  int ret = runtime_init(conf_path, _main, argv);
+  if (ret) {
+    std::cerr << "failed to start runtime" << std::endl;
+    return ret;
+  }
+  return 0;
 }
