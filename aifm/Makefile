@@ -193,6 +193,9 @@ bin/test_array_add: $(test_array_add_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_ob
 
 # bin/tcp_device_server: $(tcp_device_server_obj) $(lib_obj)
 # 	$(LDXX) -o $@ $(tcp_device_server_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
+bin/tcp_device_server: $(tcp_device_server_obj) $(lib_obj) $(librt_libs) $(RUNTIME_DEPS)
+	$(LDXX) -o $@ $(tcp_device_server_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)
+
 
 # bin/test_slab: $(test_slab_obj) $(librt_libs) $(RUNTIME_DEPS) $(lib_obj)
 # 	$(LDXX) -o $@ $(test_slab_obj) $(lib_obj) $(librt_libs) $(RUNTIME_LIBS) $(LDFLAGS)

@@ -4,6 +4,7 @@ extern "C" {
 }
 
 #include "device.hpp"
+#include "helpers.hpp"
 #include "manager.hpp"
 #include "graph_adj.hpp"
 #include "deref_scope.hpp"
@@ -15,6 +16,7 @@ extern "C" {
 #include <memory>
 #include <random>
 #include <vector>
+#include <string>
 
 using namespace far_memory;
 using std::cout;
@@ -23,8 +25,9 @@ using std::endl;
 constexpr uint64_t kCacheSize    = (128ULL << 20);
 constexpr uint64_t kFarMemSize   = (4ULL  << 30);
 constexpr uint32_t kNumGCThreads = 12;
+constexpr uint32_t kNumConnections = 300;
 
-// Reuse the banded-edge generator from your prefetch test.
+// Reuse your banded-edge generator style.
 static std::vector<std::pair<Vid,Vid>>
 gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed=42) {
   std::mt19937_64 rng(seed);
@@ -51,14 +54,14 @@ local_frontier_sum_with_deref(GraphAdj &G,
   DerefScope s;
   for (Vid u : frontier) {
     auto h = G.header_info(u, s); // forces a header deref from far mem
-    (void)h;                      // we don't use it, just touch it
+    (void)h;                      // unused for now
     total += static_cast<uint64_t>(u);
   }
   return total;
 }
 
 // --- Remote frontier aggregation: use your active component ---
-// This calls GraphAdj::remote_degree_sum, which (for now) also sums the IDs.
+// This calls GraphAdj::remote_degree_sum, which currently sums the IDs.
 static uint64_t
 remote_frontier_sum(GraphAdj &G,
                     const std::vector<Vid> &frontier) {
@@ -110,13 +113,24 @@ static void benchmark_frontier_agg(GraphAdj &G,
   cout << "Remote agg (active component)  : " << remote_us << " us / call\n";
   cout << "Relative improvement           : "
        << (speedup_pct >= 0 ? "+" : "") << speedup_pct << "%\n";
+  cout << "Done.\n";
 }
 
-// Main AIFM runtime entry.
-static void _main(void*) {
+// --- TCP-based AIFM setup, following your array example ---
+
+int g_argc; // (not strictly needed but we mirror array style)
+
+static void _main(void *arg) {
+  char **argv = static_cast<char **>(arg);
+
+  // argv[0] = ip_addr:port after the shift done in main().
+  std::string ip_addr_port(argv[0]);
+  auto raddr = helpers::str_to_netaddr(ip_addr_port);
+
   std::unique_ptr<FarMemManager> manager(
-      FarMemManagerFactory::build(kCacheSize, kNumGCThreads,
-                                  new FakeDevice(kFarMemSize)));
+      FarMemManagerFactory::build(
+          kCacheSize, kNumGCThreads,
+          new TCPDevice(raddr, kNumConnections, kFarMemSize)));
 
   // Build a medium-size graph in far memory.
   const uint64_t N = 200000;
@@ -124,16 +138,15 @@ static void _main(void*) {
   const uint32_t W = 64;
   auto edges = gen_banded_edges(N, E, W);
 
-  // Simple remoting policy (all remote for now).
+  // Simple remoting policy (all neighbors remote).
   struct AllRemote : RemotingPolicy {
     uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
   } all_remote;
 
-  // Build the graph adjacency in far memory.
   auto G = std::make_unique<GraphAdj>(manager.get(), N, all_remote);
   G->build_from_edges(edges);
 
-  // Pick a random frontier (no BFS semantics needed for this microbenchmark).
+  // Pick a random frontier.
   const size_t frontier_size = 10000;
   std::vector<Vid> frontier;
   frontier.reserve(frontier_size);
@@ -144,17 +157,30 @@ static void _main(void*) {
     frontier.push_back(static_cast<Vid>(U(rng)));
   }
 
-  // Run the sanity check + microbenchmark.
   const uint32_t iters = 200;
   benchmark_frontier_agg(*G, frontier, iters);
-
-  cout << "Done.\n";
 }
 
-int main(int argc, char* argv[]) {
-  if (argc < 2) {
-    std::cerr << "usage: " << argv[0] << " [cfg_file]\n";
+int main(int _argc, char *argv[]) {
+  if (_argc < 3) {
+    std::cerr << "usage: " << argv[0] << " [cfg_file] [ip_addr:port]\n";
     return -EINVAL;
   }
-  return runtime_init(argv[1], _main, nullptr);
+
+  // Like your array example: grab cfg_file, shift args for runtime_init.
+  char conf_path[strlen(argv[1]) + 1];
+  strcpy(conf_path, argv[1]);
+
+  // After this loop, argv[1] becomes ip_addr:port from the original argv[2].
+  for (int i = 2; i < _argc; i++) {
+    argv[i - 1] = argv[i];
+  }
+  g_argc = _argc - 1;
+
+  int ret = runtime_init(conf_path, _main, argv + 1);
+  if (ret) {
+    std::cerr << "failed to start runtime" << std::endl;
+    return ret;
+  }
+  return 0;
 }
