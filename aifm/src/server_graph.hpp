@@ -33,7 +33,7 @@ struct __attribute__((packed)) GraphAggParams {
 
 class ServerGraphAgg : public ServerDS {
 public:
-  ServerGraphAgg(uint8_t param_len, uint8_t *params) {
+  ServerGraphAgg(uint32_t param_len, uint8_t *params) {  // <-- uint32_t here
     assert(param_len == sizeof(GraphAggParams));
     GraphAggParams p;
     std::memcpy(&p, params, sizeof(p));
@@ -105,7 +105,7 @@ private:
 
 class ServerGraphAggFactory : public ServerDSFactory {
 public:
-  ServerDS *build(uint8_t param_len, uint8_t *params) override {
+  ServerDS *build(uint32_t param_len, uint8_t *params) override {  // <-- uint32_t here too
     return new ServerGraphAgg(param_len, params);
   }
 };
