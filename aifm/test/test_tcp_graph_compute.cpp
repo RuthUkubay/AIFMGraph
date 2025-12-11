@@ -90,10 +90,8 @@ local_frontier_sum_with_deref(GraphAdj &G,
 
 // ---------------------------------------------------------------------
 // Baseline 2: "headers local" client
-// - Graph still lives in far memory
-// - But we assume all headers were fetched/cached once, and now reads
-//   are from a local array (no per-iteration header derefs).
-// - This is closer to the AIFM "header local, tail remote" story.
+// Graph still lives in far memory, but we assume all headers were
+// fetched/cached once. Now we read them from a local array.
 // ---------------------------------------------------------------------
 static uint64_t
 local_frontier_sum_cached(const std::vector<Vid> &frontier,
@@ -101,8 +99,7 @@ local_frontier_sum_cached(const std::vector<Vid> &frontier,
   uint64_t total = 0;
   for (Vid u : frontier) {
     const LocalHdr &h = hdr_cache[u];
-    // Pretend we need something from the header (e.g., degree)
-    // so the compiler can't throw it away.
+    // Touch h so the compiler can't drop it
     total += static_cast<uint64_t>(u) + static_cast<uint64_t>(h.degree & 1u);
   }
   return total;
@@ -110,8 +107,7 @@ local_frontier_sum_cached(const std::vector<Vid> &frontier,
 
 // ---------------------------------------------------------------------
 // Remote aggregation via active component
-// - For now, GraphAdj::remote_degree_sum(frontier) just returns a sum
-//   that matches the locals (e.g., sum of IDs / degrees).
+// This calls GraphAdj::remote_degree_sum(frontier).
 // ---------------------------------------------------------------------
 static uint64_t
 remote_frontier_sum(GraphAdj &G,
@@ -120,7 +116,7 @@ remote_frontier_sum(GraphAdj &G,
 }
 
 // ---------------------------------------------------------------------
-// Benchmark: compare naive local vs cached-header local vs remote
+// Benchmark: naive local vs cached-header local vs remote
 // ---------------------------------------------------------------------
 static void benchmark_frontier_agg(GraphAdj &G,
                                    const std::vector<LocalHdr> &hdr_cache,
@@ -153,7 +149,7 @@ static void benchmark_frontier_agg(GraphAdj &G,
   double naive_us =
       std::chrono::duration_cast<us>(t1 - t0).count() / double(iters);
 
-  // --- Benchmark cached-header local (headers are "local") ---
+  // --- Benchmark cached-header local (headers local) ---
   auto t2 = clk::now();
   for (uint32_t i = 0; i < iters; ++i) {
     (void)local_frontier_sum_cached(frontier, hdr_cache);
@@ -219,7 +215,7 @@ static void _main(void *arg) {
   // Build header cache once: headers are "local" for the cached baseline.
   auto hdr_cache = build_header_cache(*G);
 
-  // Pick a random frontier (no BFS semantics needed).
+  // Pick a random frontier.
   const size_t frontier_size = 10000;
   std::vector<Vid> frontier;
   frontier.reserve(frontier_size);
@@ -262,4 +258,4 @@ int main(int _argc, char* argv[]) {
   }
   return 0;
 }
-
+// ---------- end of file ----------
