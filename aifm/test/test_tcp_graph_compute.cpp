@@ -16,26 +16,28 @@ extern "C" {
 #include <iostream>
 #include <memory>
 #include <random>
-#include <vector>
 #include <string>
+#include <vector>
 
 using namespace far_memory;
 using std::cout;
 using std::endl;
 
-constexpr static uint64_t kCacheSize    = (128ULL << 20);
-constexpr static uint64_t kFarMemSize   = (4ULL  << 30);
-constexpr static uint32_t kNumGCThreads = 12;
+constexpr static uint64_t kCacheSize      = (128ULL << 20);
+constexpr static uint64_t kFarMemSize     = (4ULL  << 30);
+constexpr static uint32_t kNumGCThreads   = 12;
 constexpr static uint32_t kNumConnections = 300;
 
-// Reuse the banded-edge generator from your prefetch test.
-static std::vector<std::pair<Vid,Vid>>
-gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed=42) {
+// ---------------------------------------------------------------------
+// Banded-edge generator (same as graph prefetch test)
+// ---------------------------------------------------------------------
+static std::vector<std::pair<Vid, Vid>>
+gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed = 42) {
   std::mt19937_64 rng(seed);
   std::uniform_int_distribution<uint64_t> Uu(0, N - 1);
   std::uniform_int_distribution<uint32_t> Uw(0, W - 1);
 
-  std::vector<std::pair<Vid,Vid>> edges;
+  std::vector<std::pair<Vid, Vid>> edges;
   edges.reserve(E);
   for (uint64_t i = 0; i < E; ++i) {
     Vid u = static_cast<Vid>(Uu(rng));
@@ -46,79 +48,150 @@ gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed=42) {
   return edges;
 }
 
-// --- Local baseline: sum frontier IDs, but force a far-mem header deref ---
-// This simulates a naive "look at each vertex header" aggregation.
+// ---------------------------------------------------------------------
+// A tiny "local header" struct: just what the client cares about.
+// We fill this once by dereferencing far-memory headers, then reuse it.
+// ---------------------------------------------------------------------
+struct LocalHdr {
+  uint32_t degree;
+  uint16_t inline_len;
+};
+
+// Build local header cache by doing far-mem derefs *once*.
+static std::vector<LocalHdr>
+build_header_cache(GraphAdj &G) {
+  const uint64_t n = G.num_vertices();
+  std::vector<LocalHdr> cache(n);
+
+  DerefScope s;
+  for (uint64_t u = 0; u < n; ++u) {
+    auto h = G.header_info(u, s);
+    cache[u].degree     = h.degree;
+    cache[u].inline_len = h.inline_len;
+  }
+  return cache;
+}
+
+// ---------------------------------------------------------------------
+// Baseline 1: naive local client that derefs far-mem headers every time
+// ---------------------------------------------------------------------
 static uint64_t
 local_frontier_sum_with_deref(GraphAdj &G,
                               const std::vector<Vid> &frontier) {
   uint64_t total = 0;
   DerefScope s;
   for (Vid u : frontier) {
-    auto h = G.header_info(u, s); // forces a header deref from far mem
-    (void)h;                      // we don't use it, just touch it
+    auto h = G.header_info(u, s); // far-mem header deref
+    (void)h;
     total += static_cast<uint64_t>(u);
   }
   return total;
 }
 
-// --- Remote frontier aggregation: use your active component ---
-// This calls GraphAdj::remote_degree_sum, which (for now) also sums the IDs.
+// ---------------------------------------------------------------------
+// Baseline 2: "headers local" client
+// - Graph still lives in far memory
+// - But we assume all headers were fetched/cached once, and now reads
+//   are from a local array (no per-iteration header derefs).
+// - This is closer to the AIFM "header local, tail remote" story.
+// ---------------------------------------------------------------------
+static uint64_t
+local_frontier_sum_cached(const std::vector<Vid> &frontier,
+                          const std::vector<LocalHdr> &hdr_cache) {
+  uint64_t total = 0;
+  for (Vid u : frontier) {
+    const LocalHdr &h = hdr_cache[u];
+    // Pretend we need something from the header (e.g., degree)
+    // so the compiler can't throw it away.
+    total += static_cast<uint64_t>(u) + static_cast<uint64_t>(h.degree & 1u);
+  }
+  return total;
+}
+
+// ---------------------------------------------------------------------
+// Remote aggregation via active component
+// - For now, GraphAdj::remote_degree_sum(frontier) just returns a sum
+//   that matches the locals (e.g., sum of IDs / degrees).
+// ---------------------------------------------------------------------
 static uint64_t
 remote_frontier_sum(GraphAdj &G,
                     const std::vector<Vid> &frontier) {
   return G.remote_degree_sum(frontier);
 }
 
+// ---------------------------------------------------------------------
+// Benchmark: compare naive local vs cached-header local vs remote
+// ---------------------------------------------------------------------
 static void benchmark_frontier_agg(GraphAdj &G,
+                                   const std::vector<LocalHdr> &hdr_cache,
                                    const std::vector<Vid> &frontier,
                                    uint32_t iters) {
   using clk = std::chrono::high_resolution_clock;
   using us  = std::chrono::microseconds;
 
-  // Sanity check: both paths should return the same value.
-  uint64_t local_once  = local_frontier_sum_with_deref(G, frontier);
-  uint64_t remote_once = remote_frontier_sum(G, frontier);
+  // Sanity: All three paths should agree.
+  uint64_t naive_once   = local_frontier_sum_with_deref(G, frontier);
+  uint64_t cached_once  = local_frontier_sum_cached(frontier, hdr_cache);
+  uint64_t remote_once  = remote_frontier_sum(G, frontier);
 
-  cout << "test_graph_compute: expected sum = " << local_once
-       << ", remote_sum = " << remote_once << endl;
+  cout << "test_graph_compute: naive_sum  = " << naive_once  << "\n";
+  cout << "test_graph_compute: cached_sum = " << cached_once << "\n";
+  cout << "test_graph_compute: remote_sum = " << remote_once << "\n";
 
-  if (local_once != remote_once) {
-    cout << "test_graph_compute: MISMATCH (local vs remote)!" << endl;
+  if (naive_once != cached_once || naive_once != remote_once) {
+    cout << "test_graph_compute: MISMATCH between variants!" << endl;
     return;
   }
-  cout << "test_graph_compute: PASS" << endl;
+  cout << "test_graph_compute: PASS (all variants agree)\n";
 
-  // --- Benchmark local ---
+  // --- Benchmark naive local (far-mem header each time) ---
   auto t0 = clk::now();
   for (uint32_t i = 0; i < iters; ++i) {
     (void)local_frontier_sum_with_deref(G, frontier);
   }
   auto t1 = clk::now();
-  double local_us =
+  double naive_us =
       std::chrono::duration_cast<us>(t1 - t0).count() / double(iters);
 
-  // --- Benchmark remote ---
+  // --- Benchmark cached-header local (headers are "local") ---
   auto t2 = clk::now();
+  for (uint32_t i = 0; i < iters; ++i) {
+    (void)local_frontier_sum_cached(frontier, hdr_cache);
+  }
+  auto t3 = clk::now();
+  double cached_us =
+      std::chrono::duration_cast<us>(t3 - t2).count() / double(iters);
+
+  // --- Benchmark remote active compute ---
+  auto t4 = clk::now();
   for (uint32_t i = 0; i < iters; ++i) {
     (void)remote_frontier_sum(G, frontier);
   }
-  auto t3 = clk::now();
+  auto t5 = clk::now();
   double remote_us =
-      std::chrono::duration_cast<us>(t3 - t2).count() / double(iters);
+      std::chrono::duration_cast<us>(t5 - t4).count() / double(iters);
 
-  double speedup_pct =
-      (local_us > 0.0) ? (1.0 - remote_us / local_us) * 100.0 : 0.0;
+  auto pct = [](double base, double other) {
+    return (base > 0.0) ? (1.0 - other / base) * 100.0 : 0.0;
+  };
 
   cout << "Frontier size: " << frontier.size() << "\n";
-  cout << "Local  agg (with header derefs): " << local_us  << " us / call\n";
-  cout << "Remote agg (active component)  : " << remote_us << " us / call\n";
-  cout << "Relative improvement           : "
-       << (speedup_pct >= 0 ? "+" : "") << speedup_pct << "%\n";
+  cout << "Naive   local (far-mem header per u): " << naive_us  << " us / call\n";
+  cout << "Cached  local (headers local)       : " << cached_us << " us / call\n";
+  cout << "Remote  agg  (active component)     : " << remote_us << " us / call\n";
+  cout << "Remote vs naive   : "
+       << (pct(naive_us,  remote_us) >= 0 ? "+" : "")
+       << pct(naive_us,  remote_us) << "%\n";
+  cout << "Remote vs cached  : "
+       << (pct(cached_us, remote_us) >= 0 ? "+" : "")
+       << pct(cached_us, remote_us) << "%\n";
 }
 
 int argc;
 
-// Main AIFM runtime entry.
+// ---------------------------------------------------------------------
+// Main AIFM runtime entry
+// ---------------------------------------------------------------------
 static void _main(void *arg) {
   char **argv = static_cast<char **>(arg);
   std::string ip_addr_port(argv[1]);
@@ -135,16 +208,18 @@ static void _main(void *arg) {
   const uint32_t W = 64;
   auto edges = gen_banded_edges(N, E, W);
 
-  // Simple remoting policy (all remote for now).
   struct AllRemote : RemotingPolicy {
     uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
   } all_remote;
 
-  // Build the graph adjacency in far memory.
+  // GraphAdj lives entirely in far memory (TCP-backed).
   auto G = std::make_unique<GraphAdj>(manager.get(), N, all_remote);
   G->build_from_edges(edges);
 
-  // Pick a random frontier (no BFS semantics needed for this microbenchmark).
+  // Build header cache once: headers are "local" for the cached baseline.
+  auto hdr_cache = build_header_cache(*G);
+
+  // Pick a random frontier (no BFS semantics needed).
   const size_t frontier_size = 10000;
   std::vector<Vid> frontier;
   frontier.reserve(frontier_size);
@@ -155,13 +230,16 @@ static void _main(void *arg) {
     frontier.push_back(static_cast<Vid>(U(rng)));
   }
 
-  // Run the sanity check + microbenchmark.
+  // Run sanity + microbenchmark.
   const uint32_t iters = 200;
-  benchmark_frontier_agg(*G, frontier, iters);
+  benchmark_frontier_agg(*G, hdr_cache, frontier, iters);
 
   cout << "Done.\n";
 }
 
+// ---------------------------------------------------------------------
+// Process command line and hand off to AIFM runtime
+// ---------------------------------------------------------------------
 int main(int _argc, char* argv[]) {
   if (_argc < 3) {
     std::cerr << "usage: " << argv[0] << " [cfg_file] [ip_addr:port]\n";
@@ -170,6 +248,8 @@ int main(int _argc, char* argv[]) {
 
   char conf_path[strlen(argv[1]) + 1];
   strcpy(conf_path, argv[1]);
+
+  // Shift argv so that _main sees [ip_addr:port, ...] starting at argv[1]
   for (int i = 2; i < _argc; i++) {
     argv[i - 1] = argv[i];
   }
