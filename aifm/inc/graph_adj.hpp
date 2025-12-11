@@ -15,16 +15,19 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+#include <limits>
+
+
 namespace far_memory {
 
 using Vid = uint32_t;
 
 // ------ Graph active component protocol on top of RemDevice -------
 
-// A new data structure type and ID for the graph active component.
-// These are for the *remote device* (RemDevice in the paper).
-static constexpr uint8_t kGraphAggDSType = 2;  // new DS type (distinct from kVanillaPtrDSType)
-static constexpr uint8_t kGraphDSID      = 2;  // graph instance id for compute()
+// New data structure type and instance ID for the graph active component.
+// IMPORTANT: we'll use the same values on the server side.
+static constexpr uint8_t kGraphAggDSType = 3;  // distinct from kVanillaPtrDSType
+static constexpr uint8_t kGraphDSID      = 5;  // graph instance id for compute()
 
 // Opcodes for graph-specific remote compute().
 enum GraphOpcode : uint8_t {
@@ -44,7 +47,6 @@ static_assert(sizeof(GraphDegreeSumReqHdr) == 4,
 // Parameters sent at construct() time to initialize the graph component.
 struct __attribute__((packed)) GraphAggParams {
   uint64_t num_vertices;
-  // You can extend this later if needed.
 };
 
 static_assert(sizeof(GraphAggParams) == 8,
@@ -108,6 +110,7 @@ public:
                    /*param_len=*/sizeof(params),
                    /*params=*/reinterpret_cast<uint8_t*>(&params));
   }
+
 
 
 
@@ -193,7 +196,8 @@ public:
     hdr->frontier_len = n;
 
     // Fill vertex IDs right after the header
-    auto *ids = reinterpret_cast<Vid*>(in.data() + sizeof(GraphDegreeSumReqHdr));
+    auto *ids = reinterpret_cast<Vid*>(
+        in.data() + sizeof(GraphDegreeSumReqHdr));
     std::memcpy(ids, frontier.data(), n * sizeof(Vid));
 
     uint16_t in_len  = static_cast<uint16_t>(in_bytes);
@@ -215,6 +219,7 @@ public:
     std::memcpy(&total_deg, out_buf, sizeof(total_deg));
     return total_deg;
   }
+
 
 
 

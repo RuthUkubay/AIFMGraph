@@ -14,8 +14,8 @@ extern "C" {
 namespace far_memory {
 
 // IMPORTANT: these must match the values in your GraphAdj file.
-static constexpr uint8_t kGraphAggDSType = 2;  // same as in GraphAdj
-static constexpr uint8_t kGraphDSID      = 2;  // same as in GraphAdj
+static constexpr uint8_t kGraphAggDSType = 3;  // same as in GraphAdj
+static constexpr uint8_t kGraphDSID      = 5;  // same as in GraphAdj
 
 // Opcodes (duplicate here so server can decode them).
 enum GraphOpcode : uint8_t {
