@@ -22,9 +22,9 @@ using namespace far_memory;
 using std::cout;
 using std::endl;
 
-constexpr uint64_t kCacheSize    = (128ULL << 20);
-constexpr uint64_t kFarMemSize   = (4ULL  << 30);
-constexpr uint32_t kNumGCThreads = 12;
+constexpr uint64_t kCacheSize      = (128ULL << 20);
+constexpr uint64_t kFarMemSize     = (4ULL  << 30);
+constexpr uint32_t kNumGCThreads   = 12;
 constexpr uint32_t kNumConnections = 300;
 
 // Reuse your banded-edge generator style.
@@ -46,7 +46,6 @@ gen_banded_edges(uint64_t N, uint64_t E, uint32_t W, uint64_t seed=42) {
 }
 
 // --- Local baseline: sum frontier IDs, but force a far-mem header deref ---
-// This simulates a naive "look at each vertex header" aggregation.
 static uint64_t
 local_frontier_sum_with_deref(GraphAdj &G,
                               const std::vector<Vid> &frontier) {
@@ -54,14 +53,13 @@ local_frontier_sum_with_deref(GraphAdj &G,
   DerefScope s;
   for (Vid u : frontier) {
     auto h = G.header_info(u, s); // forces a header deref from far mem
-    (void)h;                      // unused for now
+    (void)h;
     total += static_cast<uint64_t>(u);
   }
   return total;
 }
 
 // --- Remote frontier aggregation: use your active component ---
-// This calls GraphAdj::remote_degree_sum, which currently sums the IDs.
 static uint64_t
 remote_frontier_sum(GraphAdj &G,
                     const std::vector<Vid> &frontier) {
@@ -116,15 +114,15 @@ static void benchmark_frontier_agg(GraphAdj &G,
   cout << "Done.\n";
 }
 
-// --- TCP-based AIFM setup, following your array example ---
+// --- TCP-based AIFM setup, mirroring test_tcp_array_add exactly ---
 
-int g_argc; // (not strictly needed but we mirror array style)
+int g_argc;
 
 static void _main(void *arg) {
   char **argv = static_cast<char **>(arg);
 
-  // argv[0] = ip_addr:port after the shift done in main().
-  std::string ip_addr_port(argv[0]);
+  // MATCHES test_tcp_array_add: IP:port is argv[1]
+  std::string ip_addr_port(argv[1]);
   auto raddr = helpers::str_to_netaddr(ip_addr_port);
 
   std::unique_ptr<FarMemManager> manager(
@@ -167,17 +165,17 @@ int main(int _argc, char *argv[]) {
     return -EINVAL;
   }
 
-  // Like your array example: grab cfg_file, shift args for runtime_init.
   char conf_path[strlen(argv[1]) + 1];
   strcpy(conf_path, argv[1]);
 
-  // After this loop, argv[1] becomes ip_addr:port from the original argv[2].
-  for (int i = 2; i < _argc; i++) {
+  // Shift args exactly like test_tcp_array_add
+  for (int i = 2; i < _argc; ++i) {
     argv[i - 1] = argv[i];
   }
   g_argc = _argc - 1;
 
-  int ret = runtime_init(conf_path, _main, argv + 1);
+  // Pass full argv (program name + ip:port), same as array test
+  int ret = runtime_init(conf_path, _main, argv);
   if (ret) {
     std::cerr << "failed to start runtime" << std::endl;
     return ret;
