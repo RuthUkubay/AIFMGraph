@@ -173,7 +173,7 @@ static void _main(void*) {
   cout << "Policy,Variant,EdgeWorkIters,Vertices w/ local neighbors,"
           "Vertices w/ remote,Remote bytes,BFS per-iter (µs),Speedup vs baseline\n";
 
-  const uint32_t work_levels[] = {64};
+  const uint32_t work_levels[] = {256};
   const uint32_t tail_th = 16;
 
   for (uint32_t work : work_levels) {
