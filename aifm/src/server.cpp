@@ -10,6 +10,9 @@ extern "C" {
 #include "server_hashtable.hpp"
 #include "server_ptr.hpp"
 
+#include "server_graph.hpp"
+
+
 namespace far_memory {
 
 std::unique_ptr<ServerDS> Server::server_ds_ptrs_[kMaxNumDSIDs];
@@ -18,6 +21,7 @@ Server::Server() {
   register_ds(kVanillaPtrDSType, new ServerPtrFactory());
   register_ds(kHashTableDSType, new ServerHashTableFactory());
   register_ds(kDataFrameVectorDSType, new ServerDataFrameVectorFactory());
+  register_ds(kGraphAggDSType, new ServerGraphAggFactory());
 }
 
 void Server::register_ds(uint8_t ds_type, ServerDSFactory *factory) {
@@ -69,6 +73,7 @@ void Server::compute(uint8_t ds_id, uint8_t opcode, uint16_t input_len,
                      const uint8_t *input_buf, uint16_t *output_len,
                      uint8_t *output_buf) {
   auto ds_ptr = server_ds_ptrs_[ds_id].get();
+    BUG_ON(!ds_ptr);  // catch unconstructed DSID instead of segfaulting
   return ds_ptr->compute(opcode, input_len, input_buf, output_len, output_buf);
 }
 
