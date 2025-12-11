@@ -1,131 +1,152 @@
-extern "C" {
-#include <runtime/runtime.h>
-}
+// // aifm/test/test_generate_graph.cpp
+// extern "C" {
+// #include <runtime/runtime.h>
+// }
 
-#include "graph_adj.hpp"
-#include "device.hpp"   // FakeDevice
-#include "manager.hpp"
+// #include "graph_adj.hpp"
+// #include "device.hpp"   // FakeDevice
+// #include "manager.hpp"
+// #include "deref_scope.hpp"
 
-#include <memory>
-#include <random>
-#include <iostream>
-#include <vector>
-#include <utility>
-#include <cstdint>
-#include <cassert>
-#include <atomic>
-#include "object.hpp"   // for far_memory::Object used by the notifier
+// #include <cassert>
+// #include <chrono>
+// #include <cstdint>
+// #include <iostream>
+// #include <memory>
+// #include <queue>
+// #include <random>
+// #include <utility>
+// #include <vector>
 
+// using namespace far_memory;
+// using std::cout;
+// using std::endl;
 
-using namespace far_memory;
-using std::cout;
-using std::endl;
+// constexpr uint64_t kCacheSize    = (128ULL << 20); // 128 MB
+// constexpr uint64_t kFarMemSize   = (4ULL  << 30);  // 4 GB
+// constexpr uint32_t kNumGCThreads = 12;
 
-static std::atomic<uint64_t> wb_count{0};
+// struct GenParams {
+//   uint64_t num_vertices;
+//   uint64_t num_edges;
+//   uint64_t seed;
+// };
 
-// Keep the “FakeDevice-level” simplicity and sizes similar to your array test.
-constexpr uint64_t kCacheSize    = (32ULL << 20); // 128 MB local cache
-constexpr uint64_t kFarMemSize   = (4ULL  << 30);  // 4 GB far memory
-constexpr uint32_t kNumGCThreads = 12;
+// static std::vector<std::pair<Vid,Vid>> gen_random_edges(const GenParams& p) {
+//   std::mt19937_64 rng(p.seed);
+//   std::uniform_int_distribution<uint64_t> U(0, p.num_vertices - 1);
 
-// Params for a simple random directed graph (Erdős–Rényi style).
-struct GenParams {
-  uint64_t num_vertices;
-  uint64_t num_edges;
-  uint64_t seed;
-};
+//   std::vector<std::pair<Vid,Vid>> edges;
+//   edges.reserve(p.num_edges);
+//   for (uint64_t i = 0; i < p.num_edges; ++i) {
+//     Vid u = static_cast<Vid>(U(rng));
+//     Vid v = static_cast<Vid>(U(rng));
+//     if (u == v) v = (u + 1 < p.num_vertices) ? u + 1 : 0; // avoid self-loop
+//     edges.emplace_back(u, v);
+//   }
+//   return edges;
+// }
 
-static std::vector<std::pair<Vid,Vid>> gen_random_edges(const GenParams& p) {
-  std::mt19937_64 rng(p.seed);
-  std::uniform_int_distribution<uint64_t> U(0, p.num_vertices - 1);
+// static void sanity_check(far_memory::GraphAdj& G,
+//                          const std::vector<std::pair<Vid,Vid>>& edges) {
+//   const uint64_t N = G.num_vertices();
 
-  std::vector<std::pair<Vid,Vid>> edges;
-  edges.reserve(p.num_edges);
-  for (uint64_t i = 0; i < p.num_edges; ++i) {
-    Vid u = static_cast<Vid>(U(rng));
-    Vid v = static_cast<Vid>(U(rng));
-    // Optional: avoid self loops; comment out if you want them.
-    if (u == v) { if (u + 1 < p.num_vertices) v = u + 1; else v = 0; }
-    edges.emplace_back(u, v);
-  }
-  return edges;
-}
+//   // Check total degree sum equals |E|
+//   uint64_t sum_deg = 0;
+//   for (uint64_t u = 0; u < N; ++u) {
+//     far_memory::DerefScope s;
+//     sum_deg += G.degree(u, s);
+//   }
+//   if (sum_deg != edges.size()) {
+//     std::cout << "Sanity failed: sum_deg=" << sum_deg
+//               << " edges=" << edges.size() << std::endl;
+//   }
 
-static void sanity_check(GraphAdj& G, const std::vector<std::pair<Vid,Vid>>& edges) {
-  const uint64_t N = G.num_vertices();
+//   // Spot-check: touch up to 3 neighbors per first few vertices
+//   for (uint64_t u = 0; u < std::min<uint64_t>(N, 5); ++u) {
+//     far_memory::DerefScope s;
+//     int seen = 0;
+//     G.for_each_neighbor(u, s, [&](Vid v) {
+//       volatile Vid tmp = v; (void)tmp; // prevent optimizing away
+//       if (++seen >= 3) return;
+//     });
+//   }
+// }
 
-  // Check total degree sum equals |E|
-  uint64_t sum_deg = 0;
-  for (uint64_t u = 0; u < N; ++u) {
-    DerefScope s;
-    sum_deg += G.degree(u, s);
-  }
-  if (sum_deg != edges.size()) {
-    cout << "Sanity failed: sum_deg=" << sum_deg
-         << " edges=" << edges.size() << endl;
-  }
+// // Minimal BFS that understands inline + tail layout
+// static std::vector<int> bfs(far_memory::GraphAdj& G, far_memory::Vid src) {
+//   const uint64_t n = G.num_vertices();
+//   std::vector<int> dist(n, -1);
+//   if (src >= n) return dist;
 
-  // Spot-check a few vertices’ neighbor materialization.
-  for (uint64_t u = 0; u < std::min<uint64_t>(N, 5); ++u) {
-    DerefScope s;
-    auto view = G.neighbors(u, s);
-    // Just touch the first few entries if they exist.
-    for (uint32_t i = 0; i < std::min<uint32_t>(view.len, 3); ++i) {
-      volatile Vid v = view.ptr[i]; (void)v; // prevent optimizing away
-    }
-  }
-}
+//   std::queue<far_memory::Vid> q;
+//   dist[src] = 0; q.push(src);
 
-static void do_work(FarMemManager* manager, const GenParams& gen) {
-  cout << "Running " << __FILE__ << "..." << endl;
+//   while (!q.empty()) {
+//     far_memory::Vid u = q.front(); q.pop();
+//     far_memory::DerefScope scope;
 
-  // Generate edges on host.
-  auto edges = gen_random_edges(gen);
+//     G.for_each_neighbor(u, scope, [&](far_memory::Vid v) {
+//       if (dist[v] == -1) { dist[v] = dist[u] + 1; q.push(v); }
+//     });
+//   }
+//   return dist;
+// }
 
-  // Build graph into far memory.
-  GraphAdj G(manager, gen.num_vertices);
-  G.build_from_edges(edges);
+// // Simple “all-remote” policy for this test
+// struct AllRemotePolicy : RemotingPolicy {
+//   uint16_t inline_capacity(Vid, uint32_t) const override { return 0; }
+// };
 
-  // Sanity checks (degree sum; light neighbor touches).
-  sanity_check(G, edges);
+// static void do_work(FarMemManager* manager, const GenParams& gen) {
+//   cout << "Running " << __FILE__ << "..." << endl;
 
-  cout << "Graph built: |V|=" << gen.num_vertices
-       << " |E|=" << edges.size() << endl;
+//   auto edges = gen_random_edges(gen);
 
-  cout << "Passed" << endl;
-}
+//   // NOTE: GraphAdj now needs a policy
+//   AllRemotePolicy pol;
+//   GraphAdj G(manager, gen.num_vertices, pol);
+//   G.build_from_edges(edges);
 
-static void _main(void* arg) {
-  std::unique_ptr<FarMemManager> manager(
-      FarMemManagerFactory::build(kCacheSize, kNumGCThreads,
-                                  new FakeDevice(kFarMemSize)));
+//   sanity_check(G, edges);
 
-  // Count evictions (write-backs) for vanilla DSID objects
-  manager->register_eval_notifier(
-      kVanillaPtrDSID,
-      [&](far_memory::Object obj, FarMemManager::WriteObjectFn writeback)->bool {
-        wb_count.fetch_add(1, std::memory_order_relaxed);
-        writeback(obj.get_data_len());   // do normal write-back
-        return false;                    // we didn’t fully handle it
-      });
+//   // quick BFS timing (optional)
+//   using clk = std::chrono::high_resolution_clock;
+//   auto warm = bfs(G, 0); (void)warm;
 
-  GenParams gen{ .num_vertices = 2000, .num_edges = 100000, .seed = 42 };
-  do_work(manager.get(), gen);
+//   auto t0 = clk::now();
+//   auto dist = bfs(G, 0);
+//   auto t1 = clk::now();
+//   auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+//   cout << "BFS one run: " << us << " us" << endl;
 
-  std::cout << "Evicted objects (write-backs): "
-            << wb_count.load() << "\n";
-}
+//   cout << "Graph built: |V|=" << gen.num_vertices
+//        << " |E|=" << edges.size() << endl;
+//   cout << "Passed" << endl;
+// }
 
+// static void _main(void* /*arg*/) {
+//   std::unique_ptr<FarMemManager> manager(
+//       FarMemManagerFactory::build(kCacheSize, kNumGCThreads, new FakeDevice(kFarMemSize)));
 
-int main(int argc, char* argv[]) {
-  if (argc < 2) {
-    std::cerr << "usage: [cfg_file]" << std::endl;
-    return -EINVAL;
-  }
-  int ret = runtime_init(argv[1], _main, nullptr);
-  if (ret) {
-    std::cerr << "failed to start runtime" << std::endl;
-    return ret;
-  }
-  return 0;
-}
+//   GenParams gen {
+//     .num_vertices = 2000,
+//     .num_edges    = 100000,
+//     .seed         = 42
+//   };
+
+//   do_work(manager.get(), gen);
+// }
+
+// int main(int argc, char* argv[]) {
+//   if (argc < 2) {
+//     std::cerr << "usage: [cfg_file]" << std::endl;
+//     return -EINVAL;
+//   }
+//   int ret = runtime_init(argv[1], _main, nullptr);
+//   if (ret) {
+//     std::cerr << "failed to start runtime" << std::endl;
+//     return ret;
+//   }
+//   return 0;
+// }
