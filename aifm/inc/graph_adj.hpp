@@ -1,4 +1,3 @@
-// inc/graph_adj.hpp
 #pragma once
 
 extern "C" {
@@ -16,9 +15,47 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+#include <limits>
+
+
 namespace far_memory {
 
 using Vid = uint32_t;
+
+// ------ Graph active component protocol on top of RemDevice -------
+
+// New data structure type and instance ID for the graph active component.
+// IMPORTANT: we'll use the same values on the server side.
+static constexpr uint8_t kGraphAggDSType = 3;  // distinct from kVanillaPtrDSType
+static constexpr uint8_t kGraphDSID      = 5;  // graph instance id for compute()
+
+// Opcodes for graph-specific remote compute().
+enum GraphOpcode : uint8_t {
+  kGraphOpDegreeSum = 1,  // sum(degree(u)) over a frontier
+};
+
+// Request header for degree sum.
+// Wire format for compute() input_buf:
+//   [ GraphDegreeSumReqHdr ][ frontier_len * Vid ]
+struct __attribute__((packed)) GraphDegreeSumReqHdr {
+  uint32_t frontier_len;
+};
+
+static_assert(sizeof(GraphDegreeSumReqHdr) == 4,
+              "Unexpected padding in GraphDegreeSumReqHdr");
+
+// Parameters sent at construct() time to initialize the graph component.
+struct __attribute__((packed)) GraphAggParams {
+  uint64_t num_vertices;
+};
+
+static_assert(sizeof(GraphAggParams) == 8,
+              "Unexpected padding in GraphAggParams");
+
+
+
+
+
 
 /* Placement policy: how many neighbors to keep inline per vertex */
 struct RemotingPolicy {
@@ -52,9 +89,30 @@ public:
 /* Graph: adjacency lists over AIFM */
 class GraphAdj {
 public:
+  // inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices,
+  //                 const RemotingPolicy& policy)
+  //     : mgr_(mgr), policy_(policy), verts_(mgr, n_vertices) {}
+
+
+
   inline GraphAdj(FarMemManager* mgr, uint64_t n_vertices,
                   const RemotingPolicy& policy)
-      : mgr_(mgr), policy_(policy), verts_(mgr, n_vertices) {}
+      : mgr_(mgr), policy_(policy), verts_(mgr, n_vertices) {
+    // Initialize the graph active component on the remote memory server.
+    GraphAggParams params;
+    params.num_vertices = n_vertices;
+
+    FarMemDevice *dev = mgr_->get_device();
+    assert(dev != nullptr);
+
+    dev->construct(/*ds_type=*/kGraphAggDSType,
+                   /*ds_id=*/kGraphDSID,
+                   /*param_len=*/sizeof(params),
+                   /*params=*/reinterpret_cast<uint8_t*>(&params));
+  }
+
+
+
 
   inline uint64_t num_vertices() const { return verts_.size(); }
 
@@ -116,6 +174,51 @@ public:
   if (num == 0) return;
   verts_.static_prefetch(/*start=*/start, /*step=*/1, /*num=*/num);
 }
+
+  // Compute sum of degrees of a frontier via remote compute.
+  uint64_t remote_degree_sum(const std::vector<Vid>& frontier) const {
+    const uint32_t n = static_cast<uint32_t>(frontier.size());
+    if (n == 0) {
+      return 0;
+    }
+
+    // Build compute() input: [GraphDegreeSumReqHdr][frontier_len * Vid]
+    const size_t in_bytes =
+        sizeof(GraphDegreeSumReqHdr) + static_cast<size_t>(n) * sizeof(Vid);
+
+    // compute() length field is uint16_t, so enforce this bound.
+    assert(in_bytes <= std::numeric_limits<uint16_t>::max());
+
+    std::vector<uint8_t> in(in_bytes);
+
+    // Fill header
+    auto *hdr = reinterpret_cast<GraphDegreeSumReqHdr*>(in.data());
+    hdr->frontier_len = n;
+
+    // Fill vertex IDs right after the header
+    auto *ids = reinterpret_cast<Vid*>(
+        in.data() + sizeof(GraphDegreeSumReqHdr));
+    std::memcpy(ids, frontier.data(), n * sizeof(Vid));
+
+    uint16_t in_len  = static_cast<uint16_t>(in_bytes);
+    uint16_t out_len = 0;
+    uint8_t  out_buf[sizeof(uint64_t)] = {0};
+
+    FarMemDevice *dev = mgr_->get_device();
+    assert(dev != nullptr);
+
+    dev->compute(/*ds_id=*/kGraphDSID,
+                 /*opcode=*/static_cast<uint8_t>(kGraphOpDegreeSum),
+                 /*input_len=*/in_len,
+                 /*input_buf=*/in.data(),
+                 /*output_len=*/&out_len,
+                 /*output_buf=*/out_buf);
+
+    assert(out_len == sizeof(uint64_t));
+    uint64_t total_deg = 0;
+    std::memcpy(&total_deg, out_buf, sizeof(total_deg));
+    return total_deg;
+  }
 
 
 

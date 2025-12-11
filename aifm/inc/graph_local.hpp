@@ -4,11 +4,12 @@
 #include <algorithm>
 #include <queue>
 
+//Neighbors of a node are in one contiguous slice of memory
 struct CSRLocal {
   int32_t n = 0;
-  std::vector<int32_t> off;   // size n
-  std::vector<int32_t> deg;   // size n
-  std::vector<int32_t> nbr;   // size sum(deg)
+  std::vector<int32_t> off;   // starting index of node’s neighbors in nbr
+  std::vector<int32_t> deg;   // number of neighbors of node
+  std::vector<int32_t> nbr;   // size sum(deg) (all neighbors)
 
   // builder before finalize
   std::vector<std::vector<int32_t>> adj_tmp;

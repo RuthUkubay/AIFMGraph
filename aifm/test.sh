@@ -4,13 +4,27 @@ source shared.sh
 
 all_passed=1
 
+# function run_single_test {
+#     echo "Running test $1..."
+#     rerun_local_iokerneld
+#     if [[ $1 == *"tcp"* ]]; then
+#     	rerun_mem_server
+#     fi
+#     if run_program ./bin/$1 2>/dev/null | grep -q "Passed"; then
+#         say_passed
+#     else
+#         say_failed
+#     	all_passed=0
+#     fi
+# }
+
 function run_single_test {
     echo "Running test $1..."
     rerun_local_iokerneld
     if [[ $1 == *"tcp"* ]]; then
     	rerun_mem_server
     fi
-    if run_program ./bin/$1 2>/dev/null | grep -q "Passed"; then
+    if run_program ./bin/$1 | grep -q "Passed"; then
         say_passed
     else
         say_failed

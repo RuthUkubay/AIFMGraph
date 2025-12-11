@@ -108,5 +108,5 @@ inline std::vector<int> bfs_far(CSRFar<N_VERTS, MAX_EDGES> &G,
   return dist;
 }
 
-} // namespace fargraph
+} 
 // ---------- end of file ----------
